@@ -1,5 +1,6 @@
 import SubVerso.Highlighting
 import SubVerso.Module
+import SubVerso.Module.Decl
 import SubVerso.Helper.Netstring
 import Lean.Data.Json
 
@@ -409,6 +410,33 @@ def fixedTargets : IO (List (System.FilePath × String)) := do
   ]
 
 /--
+Whether `toolchain` marks the definition sites of declarations in namespaces and sections, which
+`Module.findDecl?` relies on without a position. Before Lean 4.8 many are missing (checked on 4.3.0
+and 4.8.0). Nightlies and other unrecognized toolchain strings are recent enough.
+-/
+def namespacedDefinitionSites (toolchain : String) : Bool :=
+  let ver := (toolchain.splitOn ":").getLast!
+  let ver := if ver.startsWith "v" then Compat.String.drop ver 1 else ver
+  match (ver.splitOn ".").map (·.toNat?) with
+  | some major :: some minor :: _ => major > 4 || (major == 4 && minor >= 8)
+  | _ => true
+
+/--
+Declarations in `Small.Decls`, a snippet of the command that defines each, and the defined name
+through which `Module.findDecl?` should find it.
+-/
+def desiredDeclSources : List (Lean.Name × String × Lean.Name) := [
+  (`Decls.Point, "structure Point where", `Decls.Point),
+  (`Decls.Point.x, "structure Point where", `Decls.Point.x),
+  (`Decls.Point.mk, "structure Point where", `Decls.Point),
+  (`Decls.HasNorm.norm, "class HasNorm", `Decls.HasNorm.norm),
+  (`Decls.instNormPoint, "instance instNormPoint", `Decls.instNormPoint),
+  (`Decls.add_zero', "theorem add_zero'", `Decls.add_zero'),
+  (`Decls.isOdd, "def isEven", `Decls.isOdd),
+  (`Decls.withAux, "def withAux", `Decls.withAux)
+]
+
+/--
 Runs the full test suite. `demodSrc` is the demodulized SubVerso source tree (from
 `prepareDemodulizedSource`) that backs every project's `no-mod` path dependency.
 -/
@@ -513,6 +541,22 @@ def fullRun (demodSrc : System.FilePath) : IO UInt32 := do
       let .tactics _ _ _ _ := st
         | IO.eprintln s!"Proof state 'matchRfl' not a proof state: {repr st}"; return 1
     IO.println "Auxiliary declaration names under async elaboration OK"
+
+  if !namespacedDefinitionSites myToolchain then
+    IO.println s!"Skipping declaration source tests for Lean toolchain {myToolchain}"
+  else
+    IO.println "Checking declaration sources looked up by name"
+    let declMod : Module.Module := ⟨← loadModuleContentIn "small-tests" "Small.Decls" myToolchain demodSrc⟩
+    for (name, snippet, owner) in desiredDeclSources do
+      let some src := declMod.findDecl? name
+        | IO.eprintln s!"No source found for '{name}'"; return 1
+      if src.owner? != some owner then
+        IO.eprintln s!"Source of '{name}' found via {src.owner?}, expected {owner}"; return 1
+      unless (src.code.toString.splitOn snippet).length > 1 do
+        IO.eprintln s!"Source of '{name}' does not contain {repr snippet}:\n{src.code.toString}"; return 1
+    if (declMod.findDecl? `Decls.missing).isSome then
+      IO.eprintln "Found a source for the undefined name 'Decls.missing'"; return 1
+    IO.println "Declaration sources OK"
 
   pure 0
 

@@ -104,6 +104,30 @@ The `highlighted` facet for a package, library, or module builds
 highlighted sources. It runs `subverso-extract-mod` on each module and
 writes the results to `.lake/build/highlighted`.
 
+#### Declaration Sources
+
+`SubVerso.Module.Decl` looks up a declaration's highlighted source by name in
+extracted module data. Given a `Module` (for example, read using its
+`FromJson` instance), `Module.findDecl? mod name` returns the command that
+defines `name`. The result is a `DeclSource` holding the command's highlighted
+code (including hovers), its source range and command kind, and the other names
+that the command defines:
+
+ * Declarations named in the source are found through the commands'
+   `defines`. This includes declarations in namespaces and sections,
+   structure fields, constructors, `where` auxiliaries, and every
+   declaration of a `mutual` block (each maps to the whole block).
+   Private names are compared by their user-facing names.
+ * Names that do not occur in the source, such as anonymous instances and
+   instances created by `deriving`, are found by position when one is
+   provided: `Module.findDecl? mod name (some pos)`, where `pos` is the
+   declaration's position in the module, such as the `range.pos` that
+   `Lean.findDeclarationRanges?` reports.
+ * Other auxiliary declarations whose names extend a defined name, such as
+   `Point.mk`, `Point.rec` or the equation lemma `f.eq_1`, map to the command
+   that defines the nearest enclosing name. The `owner?` field reports the name
+   that was matched.
+
 ### Helper Process
 
 SubVerso can also be used as a helper for other tools that need to be

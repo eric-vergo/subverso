@@ -3,6 +3,7 @@ import SubVerso.Examples
 import SubVerso.Highlighting
 import SubVerso.Highlighting.Anchors
 import SubVerso.Highlighting.String
+import SubVerso.Module.Decl
 
 /-! These are SubVerso tests that don't involve a subprocess, to make development easier. -/
 
@@ -1848,6 +1849,177 @@ def oldSignatureFormat : Bool :=
   (skip := oldSignatureFormat)
 
 end ConstSignatures
+
+/-! # Declaration Sources -/
+section DeclSources
+
+open Lean Elab Command in
+/--
+Elaborates `input` as a module and returns its items as `subverso-extract-mod` computes them,
+together with the resulting environment.
+-/
+def moduleFromString (input : String) : CommandElabM (Module.Module × Environment) := do
+  let inputCtx := Parser.mkInputContext input "<input>"
+  let (headerStx, parserState, msgs) ← Parser.parseHeader inputCtx
+  let commandState : Command.State :=
+    { env := (← getEnv), maxRecDepth := (← get).maxRecDepth, messages := msgs }
+  let (result, st) ← Compat.Frontend.processCommands headerStx
+    |>.run { inputCtx } |>.run { commandState, parserState, cmdPos := parserState.pos }
+  let result := result.updateLeading input
+  let hls ← runTermElabM fun _ =>
+    withTheReader Core.Context (fun ctx => { ctx with fileMap := inputCtx.fileMap }) do
+      Highlighting.highlightFrontendResult result
+  let fm := inputCtx.fileMap
+  let items := hls.zip result.syntax |>.map fun (hl, stx) => {
+    defines := hl.definedNames.toArray,
+    kind := stx.getKind,
+    range := stx.getRange?.map fun ⟨s, e⟩ => (fm.toPosition s, fm.toPosition e),
+    code := hl
+    : Module.ModuleItem }
+  return (⟨items⟩, st.commandState.env)
+
+def declFixture : String := String.intercalate "\n" [
+  "namespace Geo",
+  "/-- A point. -/",
+  "structure Point where",
+  "  x : Nat",
+  "  y : Nat",
+  "deriving Repr",
+  "",
+  "instance : Add Point where",
+  "  add p q := ⟨p.x + q.x, p.y + q.y⟩",
+  "",
+  "instance instMulPoint : Mul Point := ⟨fun p q => ⟨p.x * q.x, p.y * q.y⟩⟩",
+  "",
+  "class HasNorm (α : Type) where",
+  "  norm : α → Nat",
+  "",
+  "inductive Shape where",
+  "  | dot (p : Point)",
+  "  | seg (a b : Point)",
+  "",
+  "section",
+  "variable (n : Nat)",
+  "def double : Nat := n + n",
+  "theorem double_eq : double n = n + n := rfl",
+  "end",
+  "",
+  "mutual",
+  "  def isEven : Nat → Bool",
+  "    | 0 => true",
+  "    | n + 1 => isOdd n",
+  "  def isOdd : Nat → Bool",
+  "    | 0 => false",
+  "    | n + 1 => isEven n",
+  "end",
+  "",
+  "def withAux (n : Nat) : Nat := go n",
+  "where",
+  "  go : Nat → Nat",
+  "    | 0 => 0",
+  "    | k + 1 => go k",
+  "",
+  "private def hidden : Nat := 1",
+  "",
+  "theorem Point.add_x (p q : Point) : (p + q).x = p.x + q.x := rfl",
+  "end Geo",
+  ""]
+
+/-- Does `s` contain `part`? -/
+def String.containsSubstr (s part : String) : Bool := (s.splitOn part).length > 1
+
+open Lean Elab Command in
+/--
+Looks up `n` in `mod` and checks that the defining command's code contains `snippet` and that the
+match went through `owner?` (unless `checkOwner` is false). With `usePos`, the declaration's position
+recorded in `env` is passed.
+-/
+def assertDeclSource (mod : Module.Module) (env : Environment) (n : Name) (snippet : String)
+    (owner? : Option Name) (usePos := false) (checkOwner := true) : CommandElabM Unit := do
+  let pos? ←
+    if usePos then
+      let saved ← getEnv
+      setEnv env
+      let ranges? ← Compat.findDeclarationRangesCore? n
+      setEnv saved
+      let some ranges := ranges?
+        | throwError m!"No declaration ranges for {n}"
+      pure (some ranges.range.pos)
+    else pure none
+  let some src := mod.findDecl? n pos?
+    | throwError m!"No source found for {n}"
+  unless src.name == n do
+    throwError m!"Looked up {n} but got a source for {src.name}"
+  unless !checkOwner || src.owner? == owner? do
+    throwError m!"Expected {n} to be found via {owner?}, but it was found via {src.owner?}"
+  unless src.code.asString.containsSubstr snippet do
+    throwError m!"Source of {n} does not contain {repr snippet}:\n{src.code.asString}"
+  unless mod.items[src.index]!.code.asString == src.code.asString do
+    throwError m!"Source of {n} is not the code of item {src.index}"
+
+/--
+Before Lean 4.8, many definition sites in namespaces and sections are not marked (checked on 4.3.0
+and 4.8.0), so declarations are only found by name from 4.8 on. Lookups by position work throughout.
+-/
+def namespacedDefinitionSites : Bool :=
+  Lean.version.major > 4 || (Lean.version.major == 4 && Lean.version.minor >= 8)
+
+open Lean Elab Command in
+#eval show CommandElabM Unit from do
+  let (mod, env) ← moduleFromString declFixture
+  if namespacedDefinitionSites then
+    let check := assertDeclSource mod env
+    -- Declarations named in the source, including inside sections and with doc comments
+    check `Geo.Point "/-- A point. -/\nstructure Point where" `Geo.Point
+    check `Geo.double "def double" `Geo.double
+    check `Geo.double_eq "theorem double_eq" `Geo.double_eq
+    check `Geo.instMulPoint "instance instMulPoint" `Geo.instMulPoint
+    check `Geo.Point.add_x "theorem Point.add_x" `Geo.Point.add_x
+    -- Structure fields, class methods and constructors are found in the defining command
+    check `Geo.Point.x "structure Point" `Geo.Point.x
+    check `Geo.HasNorm.norm "class HasNorm" `Geo.HasNorm.norm
+    check `Geo.Shape.dot "inductive Shape" `Geo.Shape.dot
+    -- Auxiliary declarations whose names extend a defined name are found via that name
+    check `Geo.Point.mk "structure Point" `Geo.Point
+    check `Geo.Point.rec "structure Point" `Geo.Point
+    check `Geo.HasNorm.mk "class HasNorm" `Geo.HasNorm
+    check `Geo.Shape.casesOn "inductive Shape" `Geo.Shape
+    -- Every declaration of a `mutual` block maps to the whole block
+    check `Geo.isEven "mutual" `Geo.isEven
+    check `Geo.isOdd "def isEven" `Geo.isOdd
+    -- `where` auxiliaries map to the parent command, directly or through the parent's name
+    let some go := mod.findDecl? `Geo.withAux.go
+      | throwError "No source found for Geo.withAux.go"
+    unless go.code.asString.containsSubstr "def withAux" && some go.index == mod.definingItem? `Geo.withAux do
+      throwError "Geo.withAux.go was not found in the command defining Geo.withAux"
+    -- Private names are compared by their user-facing names
+    check `Geo.hidden "private def hidden" `Geo.hidden
+    check (mkPrivateName env `Geo.hidden) "private def hidden" (mkPrivateName env `Geo.hidden)
+    -- A name that is defined directly wins over the position
+    assertDeclSource mod env `Geo.double "def double" `Geo.double (usePos := true)
+  -- With the positions that Lean records, every declaration is found in its defining command.
+  -- (Implicit constructors such as `Geo.Point.mk` are left out: Lean 4.3.0 records a placeholder
+  -- position at the start of the file for them.)
+  for (n, snippet) in [
+      (`Geo.Point, "structure Point where"), (`Geo.Point.x, "structure Point where"),
+      (`Geo.HasNorm.norm, "class HasNorm"),
+      (`Geo.Shape.dot, "inductive Shape"), (`Geo.double, "def double"),
+      (`Geo.double_eq, "theorem double_eq"), (`Geo.instMulPoint, "instance instMulPoint"),
+      (`Geo.isEven, "mutual"), (`Geo.isOdd, "def isEven"), (`Geo.withAux, "def withAux"),
+      (`Geo.withAux.go, "def withAux"), (mkPrivateName env `Geo.hidden, "private def hidden"),
+      (`Geo.Point.add_x, "theorem Point.add_x")] do
+    assertDeclSource mod env n snippet none (usePos := true) (checkOwner := false)
+  -- Names that don't occur in the source are found only by position: anonymous and derived
+  -- instances
+  unless (mod.findDecl? `Geo.instAddPoint).isNone do
+    throwError "Expected no source for Geo.instAddPoint without a position"
+  assertDeclSource mod env `Geo.instAddPoint "instance : Add Point" none (usePos := true)
+  assertDeclSource mod env `Geo.instReprPoint "deriving Repr" none (usePos := true)
+  -- Unknown names have no source
+  unless (mod.findDecl? `Geo.missing).isNone && (mod.findDecl? `Other.thing).isNone do
+    throwError "Expected no source for undefined names"
+
+end DeclSources
 
 def main : IO Unit := pure ()
 
