@@ -2111,6 +2111,13 @@ open Lean Elab Command in
   -- Unknown names have no source
   unless (mod.findDecl? `Geo.missing).isNone && (mod.findDecl? `Other.thing).isNone do
     throwError "Expected no source for undefined names"
+  -- An item index is packaged when the module has that item, and refused past its end
+  let some i := mod.definingItem? `Geo.double
+    | throwError "No item defines Geo.double"
+  unless (mod.declSourceAt? `Geo.double i none).map (·.index) == some i do
+    throwError "Expected the item that defines Geo.double at index {i}"
+  unless (mod.declSourceAt? `Geo.double mod.items.size none).isNone do
+    throwError "Expected no source at an index past the module's last item"
 
 end DeclSources
 
