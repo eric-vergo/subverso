@@ -98,12 +98,15 @@ def Module.definingItem? (mod : Module) (n : Name) : Option Nat :=
 def Module.itemAt? (mod : Module) (pos : Lean.Position) : Option Nat :=
   mod.items.findIdx? (·.contains pos)
 
-/-- Packages the item at `index` as the source of the declaration `name`. -/
-def Module.declSourceAt (mod : Module) (name : Name) (index : Nat) (owner? : Option Name) :
-    DeclSource :=
-  let item := mod.items[index]!
-  { name, index, owner?, kind := item.kind, range := item.range, defines := item.defines,
-    code := item.code }
+/--
+Packages the item at `index` as the source of the declaration `name`, or returns `none` when the
+module has no item at `index`.
+-/
+def Module.declSourceAt? (mod : Module) (name : Name) (index : Nat) (owner? : Option Name) :
+    Option DeclSource := do
+  let item ← mod.items[index]?
+  return { name, index, owner?, kind := item.kind, range := item.range, defines := item.defines,
+           code := item.code }
 
 /--
 Finds the command that defines the declaration `n` in the module, returning its highlighted code
@@ -117,9 +120,9 @@ module documentation for the cases each step covers.
 def Module.findDecl? (mod : Module) (n : Name) (pos? : Option Lean.Position := none) :
     Option DeclSource :=
   if let some i := mod.definingItem? n then
-    some (mod.declSourceAt n i (some n))
+    mod.declSourceAt? n i (some n)
   else if let some i := pos?.bind mod.itemAt? then
-    some (mod.declSourceAt n i none)
+    mod.declSourceAt? n i none
   else
     viaPrefix n (userName n).getPrefix
 where
@@ -127,7 +130,7 @@ where
   viaPrefix (n : Name) : Name → Option DeclSource
     | .anonymous => none
     | p@(.str q _) | p@(.num q _) =>
-      if let some i := mod.definingItem? p then some (mod.declSourceAt n i (some p))
+      if let some i := mod.definingItem? p then mod.declSourceAt? n i (some p)
       else viaPrefix n q
 
 end SubVerso.Module
