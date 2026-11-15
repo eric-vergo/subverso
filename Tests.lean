@@ -658,11 +658,9 @@ Whether `toolchain` marks the definition sites of declarations in namespaces and
 and 4.8.0). Nightlies and other unrecognized toolchain strings are recent enough.
 -/
 def namespacedDefinitionSites (toolchain : String) : Bool :=
-  let ver := (toolchain.splitOn ":").getLast!
-  let ver := if ver.startsWith "v" then Compat.String.drop ver 1 else ver
-  match (ver.splitOn ".").map (·.toNat?) with
-  | some major :: some minor :: _ => major > 4 || (major == 4 && minor >= 8)
-  | _ => true
+  match toolchainVersion? toolchain with
+  | some (major, minor) => major > 4 || (major == 4 && minor >= 8)
+  | none => true
 
 /--
 Declarations in `Small.Decls`, a snippet of the command that defines each, and the defined name
