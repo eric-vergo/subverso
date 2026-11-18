@@ -20,6 +20,8 @@ import Lean.Widget.InteractiveDiagnostic
 
 -- nomodule skip
 import Std.Data.HashMap
+-- nomodule skip
+import Std.Internal.UV.System
 
 public section
 
@@ -268,13 +270,30 @@ def isModule (stx : Syntax) : Bool :=
 
 set_option linter.unusedVariables false in
 open CanBeArrayOrList in
-def importModules [CanBeArrayOrList f] (imports : f Import) (opts : Options) (trustLevel : UInt32 := 0) (isModule : Bool := false) (asServer : Bool := false) : IO Environment :=
+/--
+Imports modules into a new environment.
+
+If `setupJson?` is not `none` then it should be the text of a Lake module setup JSON file. This
+enables the Lake artifact cache. Toolchains without this feature ignore `setupJson?`.
+-/
+def importModules [CanBeArrayOrList f] (imports : f Import) (opts : Options)
+    (trustLevel : UInt32 := 0) (isModule : Bool := false)
+    (asServer : Bool := false)
+    (setupJson? : Option String := none) : IO Environment :=
   %first_succeeding [
+    do
+      let setup? : Option ModuleSetup ← setupJson?.mapM fun json => IO.ofExcept (Json.parse json >>= fromJson?)
+      let arts := (setup?.map ModuleSetup.importArts).getD {}
+      Lean.importModules (%first_succeeding [asArray imports, asList imports]) opts (trustLevel := trustLevel) (loadExts := true) (level := if isModule then if asServer then .server else .exported else .private) (arts := arts),
     Lean.importModules (%first_succeeding [asArray imports, asList imports]) opts (trustLevel := trustLevel) (loadExts := true) (level := if isModule then if asServer then .server else .exported else .private),
     Lean.importModules (%first_succeeding [asArray imports, asList imports]) opts (trustLevel := trustLevel) (loadExts := true),
     Lean.importModules (%first_succeeding [asArray imports, asList imports]) opts (trustLevel := trustLevel)
   ]
 
+
+/-- Whether `importModules` can load modules from the artifacts in a Lake module setup. -/
+def supportsSetupArtifacts : Bool :=
+  %first_succeeding [(have := @ModuleSetup.importArts; true), false]
 
 def mkRefIdentFVar [Monad m] [MonadEnv m] (id : FVarId) : m Lean.Lsp.RefIdent := do
   pure %first_succeeding [
@@ -332,6 +351,14 @@ def msgEmbedCase (embed : MsgEmbed)
     | .expr e => onExpr e
     | .goal g => onGoal g
     | .trace i cls msg c cs => onTrace i cls msg c cs
+  ]
+
+open Lean.Widget in
+def tagCodeInfos (ctx : Elab.ContextInfo) (infos : SubExpr.PosMap Elab.Info)
+    (tt : TaggedText (Nat × Nat)) : BaseIO CodeWithInfos :=
+  %first_succeeding [
+    Lean.Widget.tagCodeInfos ctx infos tt,
+    pure (Lean.Widget.tagCodeInfos ctx infos tt)
   ]
 
 section
@@ -716,7 +743,28 @@ namespace HashSet
 instance [BEq α] [Hashable α] : EmptyCollection (HashSet α) :=
   ⟨%first_succeeding [Std.HashSet.emptyWithCapacity, Std.HashSet.empty, Lean.HashSet.empty]⟩
 
+instance [BEq α] [Hashable α] : Inhabited (HashSet α) := ⟨{}⟩
+
+def insert {_ : BEq α} {_ : Hashable α} : HashSet α → α → HashSet α :=
+  %first_defined [Std.HashSet.insert, Lean.HashSet.insert]
+
+def contains {_ : BEq α} {_ : Hashable α} : HashSet α → α → Bool :=
+  %first_defined [Std.HashSet.contains, Lean.HashSet.contains]
+
+def toList {_ : BEq α} {_ : Hashable α} (xs : HashSet α) : List α :=
+  %first_succeeding [
+    Std.HashSet.fold (fun r k => k :: r) [] xs,
+    Lean.HashSet.fold (fun r k => k :: r) [] xs
+  ]
+
 end HashSet
+
+def Json.objectFields? : Json → Option (Array (String × Json))
+  | .obj kvs => some %first_succeeding [
+      kvs.foldl (fun acc k v => acc.push (k, v)) #[],
+      kvs.fold (fun acc k v => acc.push (k, v)) #[]
+    ]
+  | _ => none
 
 -- In nightly-2025-02-13, simp_arith became an error. Falling back to the old version is complicated
 -- because there's no fully-backwards-compatible syntax to use here that works all the way back to Lean 4.0.0.
@@ -819,6 +867,14 @@ open Lean Elab Command in
   elabTacticKinds `keepNestedStateKinds
     ["rw [h]", "rewrite [h]", "obtain ⟨a, b⟩ := h", "have h : Nat := by exact 0",
      "let x : Nat := by exact 0", "suffices h : Nat by trivial", "replace h : Nat := by exact 0"]
+
+def cpuMillis? : IO (Option Nat) :=
+  %first_succeeding [
+    (do
+      let r ← Std.Internal.UV.System.getrusage
+      pure (some (r.userTime.toNat + r.systemTime.toNat)) : IO (Option Nat)),
+    (pure none : IO (Option Nat))
+  ]
 
 namespace Frontend
 

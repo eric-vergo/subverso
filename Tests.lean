@@ -6,10 +6,50 @@ import Lean.Data.Json
 
 open SubVerso.Module (ModuleItem)
 open Lean.FromJson (fromJson?)
+open Lean (FVarId Name)
+open SubVerso.Highlighting (Highlighted)
 
 open SubVerso
 
 namespace SubVerso.Highlighting
+
+partial def Highlighted.varHovers : Highlighted → Array (String × String)
+  | .token ⟨.var _ type _, content⟩ => #[(content, type)]
+  | .seq hls => hls.foldl (· ++ ·.varHovers) #[]
+  | .span _ hl | .tactics _ _ _ hl => hl.varHovers
+  | _ => #[]
+
+partial def Highlighted.constDocs (name : Lean.Name) : Highlighted → Array (Option String)
+  | .token ⟨.const n _ docs _ _, _⟩ => if n == name then #[docs] else #[]
+  | .seq hls => hls.foldl (· ++ ·.constDocs name) #[]
+  | .span _ hl => hl.constDocs name
+  | .tactics _ _ _ hl => hl.constDocs name
+  | _ => #[]
+
+partial def Highlighted.goalConstDocs (name : Lean.Name) : Highlighted → Array (Option String)
+  | .seq hls => hls.foldl (· ++ ·.goalConstDocs name) #[]
+  | .span _ hl => hl.goalConstDocs name
+  | .tactics goals _ _ hl => Id.run do
+    let mut docs := hl.goalConstDocs name
+    for g in goals do
+      docs := docs ++ g.conclusion.constDocs name
+    return docs
+  | _ => #[]
+
+partial def Highlighted.MessageContents.constDocs (name : Lean.Name) :
+    Highlighted.MessageContents Highlighted → Array (Option String)
+  | .term hl => hl.constDocs name
+  | .trace _ msg children _ => children.foldl (· ++ ·.constDocs name) (msg.constDocs name)
+  | .append xs => xs.foldl (· ++ ·.constDocs name) #[]
+  | _ => #[]
+
+partial def Highlighted.messageConstDocs (name : Lean.Name) : Highlighted → Array (Option String)
+  | .seq hls => hls.foldl (· ++ ·.messageConstDocs name) #[]
+  | .span msgs hl =>
+    msgs.foldl (· ++ ·.2.constDocs name) #[] ++ hl.messageConstDocs name
+  | .tactics _ _ _ hl => hl.messageConstDocs name
+  | .point _ msg => msg.constDocs name
+  | _ => #[]
 
 partial
 def Highlighted.countProofStates (hl : Highlighted) : Nat :=
@@ -34,6 +74,56 @@ def Highlighted.messageTexts (hl : Highlighted) : Array (Highlighted.Span.Kind �
     hl'.messageTexts
   | .point k m => #[(k, m.toString)]
   | _ => #[]
+
+partial
+def Highlighted.goals (hl : Highlighted) : Array (Highlighted.Goal Highlighted) :=
+  match hl with
+  | .seq hls => Id.run do
+    let mut out := #[]
+    for x in hls do
+      out := out ++ x.goals
+    out
+  | .span _ hl' =>
+    hl'.goals
+  | .tactics goals _ _ hl' =>
+    goals ++ hl'.goals
+  | _ => #[]
+
+partial
+def Highlighted.tokens (hl : Highlighted) : Array Token :=
+  match hl with
+  | .token tok => #[tok]
+  | .seq hls => Id.run do
+    let mut out := #[]
+    for x in hls do
+      out := out ++ x.tokens
+    out
+  | .span _ hl' =>
+    hl'.tokens
+  | .tactics _ _ _ hl' =>
+    hl'.tokens
+  | _ => #[]
+
+def Token.var? (tok : Token) : Option FVarId :=
+  if let .var x _ _ := tok.kind then some x else none
+
+def Highlighted.Goal.misattributedVars (goal : Highlighted.Goal Highlighted)
+    (sourceVars : Array FVarId) : Array String := Id.run do
+  let mut names : Array (FVarId × String) := #[]
+  for h in goal.hypotheses do
+    for tok in h.names do
+      if let some x := tok.var? then
+        names := names.push (x, tok.content)
+  let mut found := #[]
+  for part in #[goal.conclusion] ++ goal.hypotheses.map (·.typeAndVal) do
+    for tok in part.tokens do
+      if let some x := tok.var? then
+        match names.find? (·.1 == x) with
+        | some (_, name) =>
+          if name != tok.content then found := found.push tok.content
+        | none =>
+          if sourceVars.contains x then found := found.push tok.content
+  found
 
 end SubVerso.Highlighting
 
@@ -70,7 +160,7 @@ def lakeVars :=
 open System in
 def loadModuleContent
     (projectDir : String) (mod : String)
-    (overrideToolchain : Option String := none) :
+    (overrideToolchain : Option String := none) (extraArgs : Array String := #[]) :
     IO (Array ModuleItem) := do
 
   let projectDir : FilePath := projectDir
@@ -96,7 +186,7 @@ def loadModuleContent
 
 
   let cmd := "elan"
-  let args := #["run", "--install", toolchain, "lake", "exe", "subverso-extract-mod", mod]
+  let args := #["run", "--install", toolchain, "lake", "exe", "subverso-extract-mod"] ++ extraArgs ++ #[mod]
   let res ← IO.Process.output {
     cmd, args, cwd := projectDir
     -- Unset Lake's environment variables
@@ -232,6 +322,45 @@ hp : p
   ("Two",
    "simp [*]",
    [""])
+]
+
+def desiredShadowingProofs : List (String × String) := [
+  ("first", "n : Nat\nh : n = n\n⊢ ∀ (n : Nat), n = n → True"),
+  ("shadowed", "n✝ : Nat\nh : n✝ = n✝\nn : Nat\nh' : n = n\n⊢ True"),
+  ("binderRenamed", "x : Nat\nh : ∀ (x_1 : Nat), x_1 + x = x + x_1\n⊢ ∀ (x_1 : Nat), x_1 = x_1"),
+  ("binderRenamedAgain", "x : Nat\nh : ∀ (x_2 : Nat), x_2 + x = x + x_2\nx_1 : Nat\n⊢ x_1 = x_1"),
+  ("alphaEquivalent", "h₁ : ∀ (a : Nat), a = a\nh₂ : ∀ (b : Nat), b = b\n⊢ True"),
+  ("hoverTypes", "α : Type\nP : α → Prop\na : α\nh : P a\n⊢ ∀ (α : Type), α = α"),
+  ("hoverTypesShadowed", "α✝ : Type\nP : α✝ → Prop\na : α✝\nh : P a\nα : Type\n⊢ α = α"),
+  ("constShadowed", "h : _root_.shadowingConst = 1\nshadowingConst : Nat\n⊢ shadowingConst = shadowingConst"),
+  ("typeChanged", "x : Nat\nh : x = x\n⊢ x = x")
+]
+
+def desiredShadowingHovers : List (String × String × Array (String × String)) := [
+  ("hoverTypes", "h", #[("P", "α → Prop"), ("a", "α")]),
+  ("hoverTypesShadowed", "h", #[("P", "α✝ → Prop"), ("a", "α✝")]),
+  ("typeChanged", "h", #[("x", "Nat"), ("x", "Nat")])
+]
+
+def desiredShadowingConclusionHovers : List (String × Array (String × String)) := [
+  ("typeChanged", #[("x", "Nat"), ("x", "Nat")])
+]
+
+def desiredReuseProofs : List (String × String) := [
+  ("pendingWitness", "⊢ ?n = ?n → True\ncase n\n⊢ Nat"),
+  ("pendingHyp", "h : ?n = ?n\n⊢ True\ncase n\n⊢ Nat"),
+  ("assignedHyp", "h : 3 = 3\n⊢ True"),
+  ("hypFirst", "h : Nat\n⊢ ∀ (b : Nat), h = b ∨ True"),
+  ("hypShadowed", "h✝ : Nat\nh : Nat\n⊢ h✝ = h ∨ True"),
+  ("hypTypeChanged", "x : Nat\nh : x = x\n⊢ x = x"),
+  ("firstBranch", "⊢ 1 = 1"),
+  ("secondBranch", "⊢ 2 = 2"),
+  ("taggedGoal", "⊢ ?n = ?n\ncase n\n⊢ Nat"),
+  ("untaggedGoal", "⊢ Nat")
+]
+
+def desiredReuseHovers : List (String × String × Array (String × String)) := [
+  ("hypTypeChanged", "h", #[("x", "Nat"), ("x", "Nat")])
 ]
 
 partial def copyRecursively (src tgt : System.FilePath) (visit : String → Bool) : IO Unit := do
@@ -370,18 +499,73 @@ def checkDemo (items : Array ModuleItem) (expectedVersion : String) : IO Nat := 
 
 /-- Loads a module from `project`, building it under `toolchain` in its per-toolchain build dir. -/
 def loadModuleContentIn (project : System.FilePath) (mod : String) (toolchain : String)
-    (demodSrc : System.FilePath) : IO (Array ModuleItem) := do
+    (demodSrc : System.FilePath) (extraArgs : Array String := #[]) : IO (Array ModuleItem) := do
   let dir ← prepareProject project toolchain demodSrc
-  loadModuleContent dir.toString mod (overrideToolchain := some toolchain)
+  loadModuleContent dir.toString mod (overrideToolchain := some toolchain) (extraArgs := extraArgs)
+
+def checkTimings (project : System.FilePath) (mod : String) (toolchain : String)
+    (demodSrc : System.FilePath) : IO Unit := do
+  let dir ← prepareProject project toolchain demodSrc
+  let cmd := "elan"
+  let args := #["run", "--install", toolchain, "lake", "exe", "subverso-extract-mod", "--timings", mod]
+  let res ← IO.Process.output { cmd, args, cwd := dir, env := lakeVars.map (·, none) }
+  if res.exitCode != 0 then loadModuleContent.reportFail dir cmd args res
+  let .ok out := Lean.Json.parse res.stdout
+    | throw <| IO.userError "Expected JSON on standard output with --timings"
+  if let .error err := Module.Module.fromJson? out then
+    throw <| IO.userError s!"Couldn't parse module JSON with --timings: {err}"
+  let lines := (res.stderr.splitOn "\n").map Compat.String.trim |>.filter (· != "")
+  let some line := lines.getLast?
+    | throw <| IO.userError "Expected timing JSON on standard error"
+  let .ok json := Lean.Json.parse line
+    | throw <| IO.userError s!"Timing output is not JSON: {line}"
+  let field (j : Lean.Json) (path : List String) : IO Lean.Json :=
+    path.foldlM (init := j) fun j k =>
+      match j.getObjVal? k with
+      | .ok v => pure v
+      | .error _ => throw <| IO.userError s!"Timing JSON lacks {".".intercalate path}: {line}"
+  let seconds (path : List String) : IO Float := do
+    match ← field json path with
+    | .num n => pure n.toFloat
+    | other => throw <| IO.userError s!"Expected a number at {".".intercalate path}, got {other.compress}"
+  for p in ["import", "elaboration", "highlighting", "export", "writing"] do
+    discard <| seconds ["phases", p, "wallSeconds"]
+    match ← field json ["phases", p, "cpuSeconds"] with
+    | .num _ | .null => pure ()
+    | other => throw <| IO.userError s!"Expected a number or null CPU time for {p}, got {other.compress}"
+  discard <| seconds ["total", "wallSeconds"]
+  let mut categoryTotal := 0.0
+  for c in ["signatures", "variableTypes", "withType", "goalHypotheses", "goalTargets", "messages", "setup", "other"] do
+    categoryTotal := categoryTotal + (← seconds ["highlighting", c])
+  let highlightingWall ← seconds ["phases", "highlighting", "wallSeconds"]
+  if (categoryTotal - highlightingWall).abs > 0.001 then
+    throw <| IO.userError s!"Highlighting categories sum to {categoryTotal}, but the phase took {highlightingWall}"
+  for c in ["delaboratorCalls", "runMetaMCalls"] do
+    match ← field json ["counters", c] with
+    | .num n =>
+      if n.toFloat ≤ 0 then throw <| IO.userError s!"Expected a positive count for {c}, got {line}"
+    | other => throw <| IO.userError s!"Expected a count for {c}, got {other.compress}"
 
 /--
-The fixed (Lean-version-independent) demo builds. These don't depend on the toolchain under test, so
-they're identical across every matrix job and are good candidates to build once and cache. Kept as
-named constants so the prebuild phase and the full test run agree on the exact toolchain strings
-(and hence on the build-directory names).
+Reads the toolchains that the `demo` project is tested with from the file `demo-toolchains`.
+
+The file holds one Lean version per line, as they would be written after `leanprover/lean4:` in a
+`lean-toolchain` file. In the return value, each toolchain is paired with its version number.
 -/
-def demoToolchain48 : String := "leanprover/lean4:v4.8.0"
-@[inherit_doc demoToolchain48] def demoToolchain410 : String := "leanprover/lean4:4.10.0"
+def demoToolchains : IO (List (String × String)) := do
+  let versions := (← IO.FS.readFile "demo-toolchains").splitOn "\n"
+    |>.map Compat.String.trim |>.filter (· != "")
+  if versions.isEmpty then
+    throw <| .userError "The file demo-toolchains doesn't list any Lean versions"
+  pure <| versions.map fun v =>
+    ("leanprover/lean4:" ++ v, if v.startsWith "v" then Compat.String.drop v 1 else v)
+
+def toolchainVersion? (toolchain : String) : Option (Nat × Nat) :=
+  let ver := (toolchain.splitOn ":").getLast!
+  let ver := if ver.startsWith "v" then Compat.String.drop ver 1 else ver
+  match (ver.splitOn ".").map (·.toNat?) with
+  | some major :: some minor :: _ => some (major, minor)
+  | _ => none
 
 /--
 The small-tests module that references a `match` auxiliary declaration by the name `toolchain`'s
@@ -391,23 +575,82 @@ Version-numbered toolchains before 4.19 elaborate synchronously and get `none`. 
 unrecognized toolchain strings are current enough for the 4.21 naming.
 -/
 def matchNamesModule (toolchain : String) : Option String :=
-  let ver := (toolchain.splitOn ":").getLast!
-  let ver := if ver.startsWith "v" then Compat.String.drop ver 1 else ver
-  match (ver.splitOn ".").map (·.toNat?) with
-  | some major :: some minor :: _ =>
+  match toolchainVersion? toolchain with
+  | some (major, minor) =>
     if major > 4 || (major == 4 && minor >= 21) then some "Small.MatchNames21"
     else if major == 4 && minor >= 19 then some "Small.MatchNames19"
     else none
-  | _ => some "Small.MatchNames21"
+  | none => some "Small.MatchNames21"
 
-/-- The `(project, toolchain)` pairs whose builds are shared across all matrix jobs. -/
+def hasGeneralizedFieldNotation (toolchain : String) : Bool :=
+  match toolchainVersion? toolchain with
+  | some (major, minor) => major > 4 || (major == 4 && minor >= 8)
+  | none => true
+
+def hasRecommendedSpelling (toolchain : String) : Bool :=
+  match toolchainVersion? toolchain with
+  | some (major, minor) => major > 4 || (major == 4 && minor >= 18)
+  | none => true
+
+partial def constSignatures (name : Name) : Highlighted → Array String
+  | .token ⟨.const n sig .., _⟩ => if n == name then #[sig] else #[]
+  | .span _ hl | .tactics _ _ _ hl => constSignatures name hl
+  | .seq hls => Id.run do
+    let mut sigs := #[]
+    for hl in hls do
+      sigs := sigs ++ constSignatures name hl
+    sigs
+  | .token .. | .text .. | .point .. | .unparsed .. => #[]
+
+def staleSignatureCases : List (Name × List String) := [
+  (`fooOne, ["foo 1", "foo 1", "F[1]"]),
+  (`barOne, ["bar 1", "bar 1", "⟪1⟫"]),
+  (`bazOne, ["baz 1", "Z[1]", "baz 1"]),
+  (`tRefl, ["(x : T)", "(x : T)", "(x : A.T)"]),
+  (`uRefl, ["(x : B.U)", "(x : B.U)", "(x : U)"])
+]
+
+def staleSignatureNoDotCases : List (Name × List String) := [
+  (`getEq, ["s.get", "s.get", "S.get s"])
+]
+
+def checkSignatures (mod : String) (items : Array ModuleItem) (cases : List (Name × List String)) :
+    IO Nat := do
+  let content := items.map (·.code) |>.foldl (· ++ ·) (.empty)
+  let mut errors := 0
+  for (name, expected) in cases do
+    let sigs := constSignatures name content
+    if sigs.size != expected.length then
+      IO.eprintln s!"{mod}: expected {expected.length} occurrences of {name}, got {sigs}"
+      errors := errors + 1
+    else
+      for (sig, part) in sigs.toList.zip expected do
+        if (sig.splitOn part).length < 2 then
+          IO.eprintln s!"{mod}: expected the signature of {name} to contain {repr part}, got {repr sig}"
+          errors := errors + 1
+  pure errors
+
+/-- Test files that define and use code in the same module or source file -/
+def inFileCodeModules (toolchain : String) : List String :=
+  let ver := (toolchain.splitOn ":").getLast!
+  let ver := if ver.startsWith "v" then Compat.String.drop ver 1 else ver
+  let modules :=
+    match (ver.splitOn ".").map (·.toNat?) with
+    | some major :: some minor :: _ => major > 4 || (major == 4 && minor >= 27)
+    | _ => true
+  if modules then ["Small.InFileCode", "Small.InFileCodeModule"] else ["Small.InFileCode"]
+
+def inFileCodeOutputs : List String :=
+  ["42", "{ x := 1, y := 4 }", "10", "5", "in-file command", "⟪3⟫ : Nat"]
+
+/--
+The `(project, toolchain)` pairs whose builds are the same for every Lean version under test.
+
+They are `demo-toml` under its own toolchain and `demo` under each toolchain in `demo-toolchains`.
+-/
 def fixedTargets : IO (List (System.FilePath × String)) := do
-  pure [
-    ("demo-toml", ← projectToolchain "demo-toml"),
-    ("demo", ← projectToolchain "demo"),
-    ("demo", demoToolchain48),
-    ("demo", demoToolchain410)
-  ]
+  let demoToml : System.FilePath × String := ("demo-toml", ← projectToolchain "demo-toml")
+  pure <| demoToml :: (← demoToolchains).map fun (toolchain, _) => ("demo", toolchain)
 
 /--
 Whether `toolchain` marks the definition sites of declarations in namespaces and sections, which
@@ -415,11 +658,9 @@ Whether `toolchain` marks the definition sites of declarations in namespaces and
 and 4.8.0). Nightlies and other unrecognized toolchain strings are recent enough.
 -/
 def namespacedDefinitionSites (toolchain : String) : Bool :=
-  let ver := (toolchain.splitOn ":").getLast!
-  let ver := if ver.startsWith "v" then Compat.String.drop ver 1 else ver
-  match (ver.splitOn ".").map (·.toNat?) with
-  | some major :: some minor :: _ => major > 4 || (major == 4 && minor >= 8)
-  | _ => true
+  match toolchainVersion? toolchain with
+  | some (major, minor) => major > 4 || (major == 4 && minor >= 8)
+  | none => true
 
 /--
 Declarations in `Small.Decls`, a snippet of the command that defines each, and the defined name
@@ -474,7 +715,7 @@ def fullRun (demodSrc : System.FilePath) : IO UInt32 := do
         IO.eprintln "Got non-tactic {hl y}"; return 1
 
   let mut proofCounts := #[]
-  for (toolchain, version) in [(← projectToolchain "demo", "4.3.0"), (demoToolchain48, "4.8.0"), (demoToolchain410, "4.10.0")] do
+  for (toolchain, version) in ← demoToolchains do
     IO.println s!"Checking the demo module with Lean toolchain {toolchain}"
     let count ← checkDemo (← loadHighlightedModuleIn "demo" "Demo" toolchain demodSrc) version
     IO.println s!"Found {count} proofs"
@@ -518,6 +759,121 @@ def fullRun (demodSrc : System.FilePath) : IO UInt32 := do
           return 1
     IO.println "Proof states for induction/cases alts OK"
 
+    IO.println "Checking --timings output"
+    checkTimings "small-tests" "Small.TacticAlts" myToolchain demodSrc
+    IO.println "Timings output OK"
+
+    IO.println "Checking that signatures follow mid-file changes to pretty printing"
+    let items ← loadModuleContentIn "small-tests" "Small.StaleSignatures" myToolchain demodSrc
+    let mut errors ← checkSignatures "Small.StaleSignatures" items staleSignatureCases
+    if hasGeneralizedFieldNotation myToolchain then
+      let items ← loadModuleContentIn "small-tests" "Small.StaleSignaturesNoDot" myToolchain demodSrc
+      errors := errors + (← checkSignatures "Small.StaleSignaturesNoDot" items staleSignatureNoDotCases)
+    if errors > 0 then
+      IO.eprintln s!"{errors} errors encountered in signatures after mid-file changes"
+      return 1
+    IO.println "Signatures after mid-file changes OK"
+
+    IO.println "Checking proof states that repeat goals and hypotheses"
+    let items ← loadModuleContentIn "small-tests" "Small.ProofStateReuse" myToolchain demodSrc
+    let content := items.map (·.code) |>.foldl (· ++ ·) (.empty)
+    match content.anchored with
+    | .error e =>
+      IO.eprintln s!"Error loading anchored content: {e}"
+      return 1
+    | .ok {code:=_, anchors:=_, proofStates} =>
+      for (name, expected) in desiredReuseProofs do
+        let some (.tactics goals _ _ _) := proofStates.get? name
+          | IO.eprintln s!"Not found: proof state '{name}'"; errors := errors + 1
+        let goalString := "\n".intercalate (goals.map (·.toString) |>.toList)
+        if goalString != expected then
+          IO.eprintln s!"Proof state '{name}': expected {repr expected} but got {repr goalString}"
+          errors := errors + 1
+      for (name, hyp, expected) in desiredReuseHovers do
+        let some (.tactics goals _ _ _) := proofStates.get? name
+          | IO.eprintln s!"Not found: proof state '{name}'"; errors := errors + 1
+        let mut hovers := #[]
+        for g in goals do
+          for h in g.hypotheses do
+            if h.names.any (·.content == hyp) then
+              hovers := hovers ++ h.typeAndVal.varHovers
+        if hovers != expected then
+          IO.eprintln s!"Proof state '{name}', hypothesis '{hyp}': expected hovers {repr expected} but got {repr hovers}"
+          errors := errors + 1
+      if errors > 0 then
+        IO.eprintln s!"{errors} errors encountered looking at proof states that repeat goals and hypotheses"
+        return 1
+    IO.println "Proof states that repeat goals and hypotheses OK"
+
+  if oldest.contains myToolchain then
+    IO.println s!"Skipping shadowed hypothesis, bound variable and nested format data tests for old Lean toolchain {myToolchain}"
+  else
+    IO.println "Checking names of shadowed hypotheses in proof states"
+    let items ← loadModuleContentIn "small-tests" "Small.Shadowing" myToolchain demodSrc
+    let content := items.map (·.code) |>.foldl (· ++ ·) (.empty)
+    match content.anchored with
+    | .error e =>
+      IO.eprintln s!"Error loading anchored content: {e}"
+      return 1
+    | .ok {code:=_, anchors:=_, proofStates} =>
+      let mut errors := 0
+      for (name, expected) in desiredShadowingProofs do
+        let some (.tactics goals _ _ _) := proofStates.get? name
+          | IO.eprintln s!"Not found: proof state '{name}'"; errors := errors + 1
+        let goalString := "\n".intercalate (goals.map (·.toString) |>.toList)
+        if goalString != expected then
+          IO.eprintln s!"Proof state '{name}': expected {repr expected} but got {repr goalString}"
+          errors := errors + 1
+      for (name, hyp, expected) in desiredShadowingHovers do
+        let some (.tactics goals _ _ _) := proofStates.get? name
+          | IO.eprintln s!"Not found: proof state '{name}'"; errors := errors + 1
+        let mut hovers := #[]
+        for g in goals do
+          for h in g.hypotheses do
+            if h.names.any (·.content == hyp) then
+              hovers := hovers ++ h.typeAndVal.varHovers
+        if hovers != expected then
+          IO.eprintln s!"Proof state '{name}', hypothesis '{hyp}': expected hovers {repr expected} but got {repr hovers}"
+          errors := errors + 1
+      for (name, expected) in desiredShadowingConclusionHovers do
+        let some (.tactics goals _ _ _) := proofStates.get? name
+          | IO.eprintln s!"Not found: proof state '{name}'"; errors := errors + 1
+        let mut hovers := #[]
+        for g in goals do
+          hovers := hovers ++ g.conclusion.varHovers
+        if hovers != expected then
+          IO.eprintln s!"Proof state '{name}', conclusion: expected hovers {repr expected} but got {repr hovers}"
+          errors := errors + 1
+      if errors > 0 then
+        IO.eprintln s!"{errors} errors encountered looking at proof states with shadowed hypotheses"
+        return 1
+    IO.println "Names of shadowed hypotheses OK"
+
+    IO.println "Checking variables bound in proof states"
+    let items ← loadModuleContentIn "small-tests" "Small.BoundVars" myToolchain demodSrc
+    let mut goals := #[]
+    let mut sourceVars := #[]
+    for item in items do
+      goals := goals ++ item.code.goals
+      sourceVars := sourceVars ++ item.code.tokens.filterMap (·.var?)
+    if goals.isEmpty then
+      IO.eprintln "No proof states found in Small.BoundVars"
+      return 1
+    let mut misattributed := #[]
+    for g in goals do
+      misattributed := misattributed ++ g.misattributedVars sourceVars
+    unless misattributed.isEmpty do
+      IO.eprintln s!"Tokens in proof states carry the variable of a different binding: {misattributed}"
+      return 1
+    IO.println "Variables bound in proof states OK"
+
+    IO.println "Checking format data for nested pretty-printer output"
+    let items ← loadModuleContentIn "small-tests" "Small.NestedDelab" myToolchain demodSrc (extraArgs := #["--collect-format"])
+    if items.isEmpty then
+      IO.eprintln "No module items found for Small.NestedDelab"
+      return 1
+    IO.println "Format data for nested pretty-printer output OK"
+
   match matchNamesModule myToolchain with
   | none =>
     IO.println s!"Skipping async auxiliary-name tests for Lean toolchain {myToolchain}"
@@ -542,6 +898,52 @@ def fullRun (demodSrc : System.FilePath) : IO UInt32 := do
         | IO.eprintln s!"Proof state 'matchRfl' not a proof state: {repr st}"; return 1
     IO.println "Auxiliary declaration names under async elaboration OK"
 
+  if oldest.contains myToolchain then
+    IO.println s!"Skipping in-file code tests for old Lean toolchain {myToolchain}"
+  else
+    for mod in inFileCodeModules myToolchain do
+      IO.println s!"Checking code defined and used in {mod}"
+      let items ← loadModuleContentIn "small-tests" mod myToolchain demodSrc
+      let content := items.map (·.code) |>.foldl (· ++ ·) (.empty)
+      if content.hasError then
+        IO.eprintln s!"Error span in {mod}"
+        return 1
+      let infos := content.messageTexts.filter (·.1 == .info) |>.map (Compat.String.trim ·.2)
+      for expected in inFileCodeOutputs do
+        unless infos.contains expected do
+          IO.eprintln s!"Expected the message {repr expected} in {mod}, got {repr infos}"
+          return 1
+      IO.println s!"Code defined and used in {mod} OK"
+
+  if oldest.contains myToolchain || !hasRecommendedSpelling myToolchain then
+    IO.println s!"Skipping recommended spelling docstring tests for Lean toolchain {myToolchain}"
+  else
+    IO.println "Checking docstrings of an imported constant around a later recommended spelling"
+    let items ← loadModuleContentIn "small-tests" "Small.LaterSpelling" myToolchain demodSrc
+    let codeOf (decl : Lean.Name) : Highlighted :=
+      items.filter (·.defines.contains decl) |>.foldl (· ++ ·.code) .empty
+    let hasSpelling (doc : Option String) : Bool :=
+      doc.any fun d : String => (d.splitOn "maxOfTwo").length > 1
+    let before := codeOf `maxBeforeSpelling
+    let after := codeOf `maxAfterSpelling
+    let messageDocs := items.map (·.code.messageConstDocs ``Max.max)
+      |>.filter (!·.isEmpty)
+    if messageDocs.size != 2 then
+      IO.eprintln s!"Expected two messages that mention Max.max, got {repr messageDocs}"
+      return 1
+    let cases := [
+      ("statement before", before.constDocs ``Max.max, false),
+      ("goal before", before.goalConstDocs ``Max.max, false),
+      ("message before", messageDocs[0]!, false),
+      ("statement after", after.constDocs ``Max.max, true),
+      ("goal after", after.goalConstDocs ``Max.max, true),
+      ("message after", messageDocs[1]!, true)
+    ]
+    for (label, docs, expected) in cases do
+      if docs.isEmpty || docs.any (hasSpelling · != expected) then
+        IO.eprintln s!"Max.max docstrings in the {label}: expected spelling {expected}, got {repr docs}"
+        return 1
+    IO.println "Docstrings around a later recommended spelling OK"
   if !namespacedDefinitionSites myToolchain then
     IO.println s!"Skipping declaration source tests for Lean toolchain {myToolchain}"
   else
@@ -562,8 +964,8 @@ def fullRun (demodSrc : System.FilePath) : IO UInt32 := do
 
 /--
 Builds the fixed-toolchain demo targets (or a single `<project> <toolchain>` pair) into their
-per-toolchain build directories and exits, without running any assertions. Used by the CI prebuild
-job to cache the builds that are shared across all matrix jobs.
+per-toolchain build directories and exits, without running any assertions. CI uses it to cache the
+builds that are shared across all Lean versions under test.
 -/
 def prepare (demodSrc : System.FilePath) (args : List String) : IO UInt32 := do
   let targets ← match args with

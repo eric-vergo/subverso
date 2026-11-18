@@ -3,6 +3,7 @@ import SubVerso.Examples
 import SubVerso.Highlighting
 import SubVerso.Highlighting.Anchors
 import SubVerso.Highlighting.String
+import SubVerso.Module.Normalize
 import SubVerso.Module.Decl
 
 /-! These are SubVerso tests that don't involve a subprocess, to make development easier. -/
@@ -333,6 +334,44 @@ open Lean Elab Command in
   | .ok hl' =>
     unless (toJson hl').compress == (toJson hl).compress && hl'.toString == hl.toString do
       throwError "The `conv` proof changed in a JSON round trip"
+
+open Lean Elab Command Highlighting in
+#eval show CommandElabM Unit from do
+  let input := "example (f : {α : Type} → α → α) (h : f 1 = 1) : f 1 = 1 := by\n  exact h\n"
+  let inputCtx := Parser.mkInputContext input "<input>"
+  let (headerStx, parserState, msgs) ← Parser.parseHeader inputCtx
+  let commandState : Command.State :=
+    { env := (← getEnv), maxRecDepth := (← get).maxRecDepth, messages := msgs }
+  let (result, _) ← Compat.Frontend.processCommands headerStx
+    |>.run { inputCtx } |>.run { commandState, parserState, cmdPos := parserState.pos }
+  let trees := result.items.foldl (init := #[]) fun acc item => acc ++ item.info.toArray
+  let tactics := trees.foldl (init := #[]) fun acc t =>
+    t.foldInfo (init := acc) fun ci info acc =>
+      match info with
+      | .ofTacticInfo ti => if ti.goalsBefore.isEmpty then acc else acc.push (ci, ti)
+      | _ => acc
+  let some (ci, ti) := tactics[0]?
+    | throwError "No tactic info with goals found"
+  let ci := { ci with mctx := ti.mctxBefore }
+  let ciExplicit := { ci with options := ci.options.setBool `pp.explicit true }
+  let sigCache ← IO.mkRef {}
+  let ctxt : Highlighting.Context := {
+    ids := {}, definitionsPossible := false, includeUnparsed := false, suppressNamespaces := [],
+    sigCache
+  }
+  let act : HighlightM (Array (Highlighted.Goal Highlighted) × Array (Highlighted.Goal Highlighted)) := do
+    let plain ← highlightGoals ci ci.env ti.goalsBefore
+    let explicit ← highlightGoals ciExplicit ci.env ti.goalsBefore
+    pure (plain, explicit)
+  let (plain, explicit) ← runTermElabM fun _ =>
+    withTheReader Core.Context (fun ctx => { ctx with fileMap := inputCtx.fileMap }) do
+      let (goals, _) ← act.run ctxt |>.run {} |>.run .empty
+      pure goals
+  let conclusions (goals : Array (Highlighted.Goal Highlighted)) := goals.toList.map (·.conclusion.toString)
+  unless conclusions plain == ["f 1 = 1"] do
+    throwError m!"Unexpected goal without pp.explicit: {repr (conclusions plain)}"
+  unless (conclusions explicit).any (·.startsWith "@") do
+    throwError m!"Unexpected goal with pp.explicit: {repr (conclusions explicit)}"
 
 open Lean Elab Command in
 -- Each frontend item's messages are the command's own parse errors and elaboration messages, even
@@ -1709,6 +1748,49 @@ def assertVarHoverTypes (src : String) (name : String) (expected : List String)
     "  trivial"])
   "h" ["x = x", "x = x", "y = y"]
 
+#eval assertVarHoverTypes
+  (String.intercalate "\n" [
+    "example : ∀ (n : Nat), n = n → ∀ (n : Nat), n = n → True :=",
+    "  fun n h n h' => (fun _ _ => trivial) h h'"])
+  "h" ["n = n", "n✝ = n✝"]
+
+open Lean Meta in
+def succFieldNotationFollowsType : MetaM Bool := do
+  let render (ty : Expr) : MetaM String :=
+    withLocalDeclD `x ty fun x => return toString (← ppExpr (mkApp (mkConst ``Nat.succ) x))
+  let nat := mkConst ``Nat
+  return (← render nat) == "x.succ" &&
+    (← render (mkApp (mkConst ``id [.succ .zero]) nat)) == "Nat.succ x"
+
+open Lean Elab Command in
+#eval show CommandElabM Unit from do
+  assertVarHoverTypes
+    (String.intercalate "\n" [
+      "example (x : id Nat) (h : Nat.succ x = Nat.succ x) : True := by",
+      "  have := h",
+      "  dsimp only [id] at x",
+      "  have := h",
+      "  trivial"])
+    "h" ["Nat.succ x = Nat.succ x", "Nat.succ x = Nat.succ x", "x.succ = x.succ"]
+    (skip := !(← liftTermElabM succFieldNotationFollowsType))
+
+#eval assertVarHoverTypes
+  (String.intercalate "\n" [
+    "def varTypeNotationFoo (n : Nat) : Nat := n + 1",
+    "example (h : varTypeNotationFoo 1 = 2) : True := by have := h; trivial",
+    "local notation \"F[\" n \"]\" => varTypeNotationFoo n",
+    "example (h : varTypeNotationFoo 1 = 2) : True := by have := h; trivial"])
+  "h" ["varTypeNotationFoo 1 = 2", "varTypeNotationFoo 1 = 2", "F[1] = 2", "F[1] = 2"]
+
+#eval assertVarHoverTypes
+  (String.intercalate "\n" [
+    "example : ∃ n : Nat, n = 1 → ∀ m : Nat, m = m ∧ m = m := by",
+    "  refine ⟨?n, fun h m => ⟨?l, ?r⟩⟩",
+    "  case l => exact (fun _ => Eq.refl m) h",
+    "  case n => exact 1",
+    "  case r => exact (fun _ => Eq.refl m) h"])
+  "h" ["?n = 1", "?n = 1", "1 = 1"]
+
 end VarHoverTypes
 
 /-! # Point Diagnostic Extents -/
@@ -1846,6 +1928,17 @@ def oldSignatureFormat : Bool :=
     "def baz : N.T := N.foo",
     ""])
   "N.foo" ["N.foo : N.T"]
+  (skip := oldSignatureFormat)
+
+#eval assertConstSigs
+  (String.intercalate "\n" [
+    "def foo (n : Nat) : Nat := n + 1",
+    "theorem fooOne : foo 1 = 2 := rfl",
+    "example : foo 1 = 2 := fooOne",
+    "local notation \"F[\" n \"]\" => foo n",
+    "example : foo 1 = 2 := fooOne",
+    ""])
+  "fooOne" ["fooOne : foo 1 = 2", "fooOne : foo 1 = 2", "fooOne : F[1] = 2"]
   (skip := oldSignatureFormat)
 
 end ConstSignatures
@@ -2052,3 +2145,269 @@ open Lean Elab Command SubVerso.Compat in
   let toks := hls.foldl (init := #[]) fun acc hl => acc ++ docCommentTokens hl
   unless toks == #["/-!\nA *module* doc\n-/", "/--\nSome *docs* here\n-/"] do
     throwError "Expected one doc comment token per Verso comment, got {toks.toList}"
+
+def nestedMessageEnvTarget : Nat := 0
+
+partial def messageConstDocs (name : Lean.Name) :
+    Highlighting.Highlighted.MessageContents Highlighting.Highlighted → Array (Option String)
+  | .term hl => hl.tokenList.filterMap fun
+    | ⟨.const n _ docs _ _, _⟩ => if n == name then some docs else none
+    | _ => none
+  | .trace _ msg children _ =>
+    children.foldl (· ++ messageConstDocs name ·) (messageConstDocs name msg)
+  | .append xs => xs.foldl (· ++ messageConstDocs name ·) #[]
+  | _ => #[]
+
+open Lean Elab Command in
+#eval show CommandElabM Unit from do
+  let before ← getEnv
+  elabCommand (← `(/-- Nested message environment -/ add_decl_doc nestedMessageEnvTarget))
+  let after ← getEnv
+  setEnv before
+  let ctx (env : Environment) : MessageDataContext := { env, mctx := {}, lctx := {}, opts := {} }
+  let target := MessageData.ofExpr (mkConst ``nestedMessageEnvTarget)
+  let data := MessageData.withContext (ctx before) <|
+    m!"before: " ++ target ++ m!", after: " ++ MessageData.withContext (ctx after) target
+  let msg : Message := { fileName := "<test>", pos := ⟨1, 0⟩, data }
+  let hl ← runTermElabM fun _ => Highlighting.highlightMessage msg
+  let docs := messageConstDocs ``nestedMessageEnvTarget hl.contents
+  unless docs.size == 2 && docs[0]!.isNone && docs[1]!.isSome do
+    throwError "Expected the docstring only in the nested context, got {repr docs}"
+
+def laterKeywordDocs (hl : Highlighting.Highlighted) : Array (Option String) :=
+  hl.tokenList.filterMap fun
+    | ⟨.keyword _ _ docs, "laterDocKw"⟩ => some docs
+    | _ => none
+
+open Lean Elab Command in
+#eval show CommandElabM Unit from do
+  let input :=
+    "syntax (name := laterDocKwStx) \"laterDocKw\" : term\n" ++
+    "macro_rules | `(laterDocKw) => `(0)\n" ++
+    "example : Nat := laterDocKw\n" ++
+    "/-- Later keyword docs -/ add_decl_doc laterDocKwStx\n" ++
+    "example : Nat := laterDocKw\n"
+  let docs := laterKeywordDocs (← highlightModuleStyle input)
+  unless docs.size == 3 && docs[1]!.isNone && docs[2]!.isSome do
+    throwError "Expected the keyword docstring only after it is added, got {repr docs}"
+
+def proofStateEnvTarget : Nat := 0
+
+open Lean Elab Command in
+#eval show CommandElabM Unit from do
+  let input :=
+    "/-- Proof state environment -/ add_decl_doc proofStateEnvTarget\n" ++
+    "theorem proofStateEnvCheck : proofStateEnvTarget = 0 := by\n  rfl\n"
+  let inputCtx := Parser.mkInputContext input "<input>"
+  let (headerStx, parserState, msgs) ← Parser.parseHeader inputCtx
+  let commandState : Command.State :=
+    { env := (← getEnv), maxRecDepth := (← get).maxRecDepth, messages := msgs }
+  let (result, _) ← Compat.Frontend.processCommands headerStx
+    |>.run { inputCtx } |>.run { commandState, parserState, cmdPos := parserState.pos }
+  let mut docs : Array (Option String) := #[]
+  for item in result.items do
+    let mut tactics : List (ContextInfo × TacticInfo) := []
+    for t in item.info.toArray do
+      tactics := tactics ++ t.collectNodesBottomUp fun ci info _ soFar =>
+        match info with
+        | .ofTacticInfo ti => (ci, ti) :: soFar
+        | _ => soFar
+    if let some (ci, ti) := tactics.find? (!·.2.goalsBefore.isEmpty) then
+      let ci := { ci with mctx := ti.mctxBefore }
+      let goals ← runTermElabM fun _ =>
+        withTheReader Core.Context (fun ctx => { ctx with fileMap := inputCtx.fileMap }) do
+          Highlighting.highlightProofState ci ti.goalsBefore item.info
+      for g in goals do
+        docs := docs ++ g.conclusion.tokenList.filterMap fun
+          | ⟨.const n _ d _ _, _⟩ => if n == ``proofStateEnvTarget then some d else none
+          | _ => none
+  unless !docs.isEmpty && docs.all (·.isSome) do
+    throwError "Expected the docstring from the command's environment in the proof state, got {repr docs}"
+
+section ModuleNormalize
+
+open SubVerso.Highlighting
+open SubVerso.Module (Module ModuleItem normalize rangeToJson)
+open Lean (Name Json toJson)
+open Lean.Elab.Command (CommandElabM)
+
+def normVar (n : Nat) : Highlighted :=
+  .token ⟨.var ⟨Name.mkNum `_uniq n⟩ "Nat" none, "x"⟩
+
+def normConst (name : Name) (sig : String) : Highlighted :=
+  .token ⟨.const name sig none false none, name.toString⟩
+
+def normItem (code : Highlighted) (line : Nat := 1) : ModuleItem :=
+  { range := some (⟨line, 0⟩, ⟨line, 20⟩), kind := `test, defines := #[], code }
+
+def normGoal (hyp concl : Nat) : Highlighted :=
+  .tactics #[{
+      name := none,
+      goalPrefix := "⊢ ",
+      hypotheses := #[{ names := #[⟨.var ⟨Name.mkNum `_uniq hyp⟩ "Nat" none, "h"⟩], typeAndVal := normVar concl }],
+      conclusion := .seq #[normVar hyp, .text " = ", normVar concl] }]
+    0 5 (.text "simp")
+
+def normSample (v w x : Nat) (sig : String := "f : Nat") : Module := ⟨#[
+  normItem (.seq #[.text "def ", normConst `f sig, .text " := ", normVar v]),
+  normItem (.span #[(.info, .text "note")] (normGoal w x)) 2
+]⟩
+
+def assertNormalizeSame (a b : Module) : CommandElabM Unit := do
+  let na := (normalize a).compress
+  let nb := (normalize b).compress
+  unless na == nb do
+    throwError m!"Expected equal normal forms, got\n{na}\nand\n{nb}"
+
+def assertNormalizeDifferent (a b : Module) : CommandElabM Unit := do
+  let na := (normalize a).compress
+  unless na != (normalize b).compress do
+    throwError m!"Expected different normal forms, both are\n{na}"
+
+#eval assertNormalizeSame (normSample 3 4 5) (normSample 3 4 5)
+
+#eval show CommandElabM Unit from do
+  let sample := normSample 3 4 5
+  let .arr items := normalize sample
+    | throwError "Expected an array of items"
+  let ranges := items.map (·.getObjValD "range")
+  unless ranges == sample.items.map (·.range.map rangeToJson |>.getD .null) do
+    throwError m!"Expected the items in source order, got ranges {ranges}"
+
+#eval assertNormalizeSame (normSample 3 4 5) (normSample 30 50 40)
+
+#eval assertNormalizeDifferent (normSample 3 4 5) (normSample 3 4 4)
+
+#eval assertNormalizeDifferent (normSample 3 4 5) (normSample 3 4 5 (sig := "f : Int"))
+
+#eval assertNormalizeDifferent
+  (normSample 3 4 5 (sig := "f : " ++ String.join (List.replicate 80 "x") ++ "Nat"))
+  (normSample 3 4 5 (sig := "f : " ++ String.join (List.replicate 80 "x") ++ "Int"))
+
+#eval assertNormalizeDifferent (normSample 3 4 5)
+  ⟨#[(normSample 3 4 5).items[0]!, { (normSample 3 4 5).items[1]! with range := some (⟨2, 0⟩, ⟨3, 4⟩) }]⟩
+
+#eval assertNormalizeDifferent
+  ⟨#[normItem (.seq #[normVar 1, normVar 2])]⟩
+  ⟨#[normItem (.seq #[normVar 7, normVar 7])]⟩
+
+#eval assertNormalizeDifferent
+  ⟨#[normItem (.seq #[normVar 1, normVar 1])]⟩
+  ⟨#[normItem (.seq #[normVar 7, normVar 8])]⟩
+
+#eval assertNormalizeSame
+  ⟨#[normItem (.seq #[normVar 1]), normItem (.seq #[normVar 1]) 2]⟩
+  ⟨#[normItem (.seq #[normVar 7]), normItem (.seq #[normVar 8]) 2]⟩
+
+#eval show CommandElabM Unit from do
+  let roundTrip (m : Module) : CommandElabM Module :=
+    match Module.fromJson? (toJson m) with
+    | .ok m' => pure m'
+    | .error e => throwError e
+  let sample := normSample 3 4 5
+  let shifted : Module := ⟨#[
+    normItem (.seq #[.token ⟨.keyword none none none, "a"⟩, .text "b", .token ⟨.keyword none none none, "c"⟩]),
+    sample.items[1]!]⟩
+  let codeKey (m : Module) : Option Json := do
+    let items ← (toJson m).getObjValD "items" |>.getArr? |>.toOption
+    (← items[1]?).getObjVal? "code" |>.toOption
+  if codeKey sample == codeKey shifted then
+    throwError "Expected the second item's key to differ, got {codeKey sample}"
+  assertNormalizeSame sample (← roundTrip sample)
+  assertNormalizeSame ⟨#[sample.items[1]!]⟩ ⟨#[(← roundTrip shifted).items[1]!]⟩
+
+end ModuleNormalize
+
+namespace SubVerso.Highlighting
+section CollectFormat
+open Lean Elab Command
+
+def moduleFrontendResult (input : String) : CommandElabM (Compat.Frontend.FrontendResult × FileMap) := do
+  let inputCtx := Parser.mkInputContext input "<input>"
+  let (headerStx, parserState, msgs) ← Parser.parseHeader inputCtx
+  let commandState : Command.State :=
+    { env := (← getEnv), maxRecDepth := (← get).maxRecDepth, messages := msgs }
+  let commandState :=
+    let sc := commandState.scopes[0]!
+    { commandState with scopes := { sc with opts := sc.opts.setBool `pp.tagAppFns true } :: commandState.scopes.tail! }
+  let (result, _) ← Compat.Frontend.processCommands headerStx
+    |>.run { inputCtx } |>.run { commandState, parserState, cmdPos := parserState.pos }
+  return (result.updateLeading input, inputCtx.fileMap)
+
+abbrev FormatM := StateM (Array (String × String))
+
+def recordFormat (what : String) : Option String → FormatM Unit
+  | some s => modify (·.push (what, s))
+  | none => pure ()
+
+def Token.Kind.eraseFormat : Token.Kind → FormatM Token.Kind
+  | .const n sig docs isDef fmt => do recordFormat "signature" fmt; pure (.const n sig docs isDef none)
+  | .anonCtor n sig docs fmt => do recordFormat "signature" fmt; pure (.anonCtor n sig docs none)
+  | .var x ty fmt => do recordFormat "type" fmt; pure (.var x ty none)
+  | .wildcard ty fmt => do recordFormat "type" fmt; pure (.wildcard ty none)
+  | .num ty fmt => do recordFormat "type" fmt; pure (.num ty none)
+  | k => pure k
+
+def Token.eraseFormat (tok : Token) : FormatM Token :=
+  return { tok with kind := ← tok.kind.eraseFormat }
+
+partial def Highlighted.eraseFormat : Highlighted → FormatM Highlighted
+  | .token tok => .token <$> tok.eraseFormat
+  | .seq xs => .seq <$> xs.mapM eraseFormat
+  | .span info x => do
+    let info ← info.mapM fun (k, m) => do pure (k, ← messageFormat m)
+    pure (.span info (← eraseFormat x))
+  | .tactics goals s e x => do
+    let goals ← goals.mapM goalFormat
+    pure (.tactics goals s e (← eraseFormat x))
+  | .point k m => .point k <$> messageFormat m
+  | other => pure other
+where
+  goalFormat (g : Highlighted.Goal Highlighted) : FormatM (Highlighted.Goal Highlighted) := do
+    let hyps ← g.hypotheses.mapM fun h => do
+      recordFormat "hypothesis" h.ppType
+      pure { h with
+        names := ← h.names.mapM Token.eraseFormat,
+        typeAndVal := ← eraseFormat h.typeAndVal,
+        ppType := none }
+    recordFormat "conclusion" g.ppConclusion
+    pure { g with hypotheses := hyps, conclusion := ← eraseFormat g.conclusion, ppConclusion := none }
+  messageFormat : Highlighted.MessageContents Highlighted → FormatM (Highlighted.MessageContents Highlighted)
+    | .text s => pure (.text s)
+    | .goal g => .goal <$> goalFormat g
+    | .term e => .term <$> eraseFormat e
+    | .trace cls m cs c => do pure (.trace cls (← messageFormat m) (← cs.mapM messageFormat) c)
+    | .append xs => .append <$> xs.mapM messageFormat
+
+def collectFormatInput : String :=
+  "def double (n : Nat) : Nat := n + n\n" ++
+  "theorem fmtTest (xs : List Nat) (h : xs.length ≤ double 2) :\n" ++
+  "    ∀ n, n ≤ xs.length → n ≤ double 2 + 0 := by\n" ++
+  "  intro n hn\n" ++
+  "  have h' : n ≤ double 2 := Nat.le_trans hn h\n" ++
+  "  let k := double n\n" ++
+  "  have hk : k = n + n := rfl\n" ++
+  "  exact Nat.le_trans h' (Nat.le_add_right _ _)\n"
+
+#eval show CommandElabM Unit from do
+  let (result, fileMap) ← moduleFrontendResult collectFormatInput
+  let (plain, withFormat) ← runTermElabM fun _ =>
+    withTheReader Core.Context (fun ctx => { ctx with fileMap }) do
+      let plain ← highlightFrontendResult result
+      let withFormat ← highlightFrontendResult result (collectFormat := true)
+      pure (plain, withFormat)
+  let (plain', plainFmts) := (plain.mapM Highlighted.eraseFormat).run #[]
+  unless plainFmts.isEmpty do
+    throwError "Format data present without `collectFormat`: {plainFmts}"
+  let (erased, fmts) := (withFormat.mapM Highlighted.eraseFormat).run #[]
+  unless erased == plain' do
+    throwError "Collecting format data changed the highlighted code"
+  for what in ["hypothesis", "conclusion", "signature", "type"] do
+    unless fmts.any (·.1 == what) do
+      throwError "No {what} format data"
+  for (what, s) in fmts do
+    let .ok j := Json.parse s
+      | throwError "The {what} format data isn't JSON: {s}"
+    unless (j.getObjVal? "fmt").toOption.isSome && (j.getObjVal? "annotations").toOption.isSome do
+      throwError "The {what} format data lacks `fmt` or `annotations`: {s}"
+

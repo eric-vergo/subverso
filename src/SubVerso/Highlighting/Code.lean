@@ -8,19 +8,23 @@ import Lean.Widget.InteractiveCode
 import Lean.Widget.InteractiveDiagnostic
 import Lean.Widget.TaggedText
 import Lean.Server.References
+import Lean.Util.CollectFVars
+import Lean.Util.FoldConsts
 import Lean.Elab.Term
 
 public import SubVerso.Compat
 public import SubVerso.Highlighting.Highlighted
 import SubVerso.Highlighting.Messages
+public import SubVerso.Highlighting.Timings
 public section
 
-open Lean hiding perhaps (HashMap)
+open Lean hiding perhaps (HashMap HashSet)
 open Elab
 open Lean.Widget (TaggedText)
 open Lean.Widget
 open Lean.PrettyPrinter (InfoPerPos)
 open SubVerso.Compat (HashMap HashSet)
+open SubVerso.Highlighting.Timings (Category Counter enter exit)
 
 
 namespace SubVerso.Highlighting
@@ -72,6 +76,9 @@ def infoTreeCommandEnv? (t : InfoTree) : Option Environment :=
   | .error ci => some ci.env
   | .ok _ => none
 
+def infoTreesCommandEnv? (trees : Array InfoTree) : Option Environment :=
+  trees.reverse.findSome? infoTreeCommandEnv?
+
 /-- Indexes every info node of the tree by its syntax's canonical range. -/
 partial def InfoTable.indexNodes (t : InfoTree) (table : InfoTable) : InfoTable :=
   let commandEnv? := infoTreeCommandEnv? t
@@ -91,12 +98,30 @@ def InfoTable.ofInfoTrees (ts : Array InfoTree) (init : InfoTable := {}) : InfoT
 def InfoTable.nodesFor (table : InfoTable) (rng : Compat.Syntax.Range) : Array InfoNode :=
   (Compat.HashMap.get? table.nodesByRange rng).getD #[]
 
-def InfoTable.tacticInfo? (stx : Syntax) (table : InfoTable) : Option (Array (ContextInfo × TacticInfo)) := do
+def InfoTable.tacticInfo? (stx : Syntax) (table : InfoTable) :
+    Option (Array (ContextInfo × TacticInfo × Environment)) := do
   let rng ← stx.getRange? (canonicalOnly := true)
   pure <| table.nodesFor rng |>.filterMap fun node =>
     match node.info with
-    | .ofTacticInfo ti => if ti.stx == stx then some (node.ci, ti) else none
+    | .ofTacticInfo ti => if ti.stx == stx then some (node.ci, ti, node.commandEnv) else none
     | _ => none
+
+/--
+Fresh FVarIds created during delaboration (e.g. bound variables in proof state hypothesis types) are
+created with this unique prefix so that they don't clash with FVarIDs chosen by delaboration
+generally.
+
+When they clashed, it could lead to incorrect highlighting or stack overflows.
+-/
+def delabNamePrefix : Name := `_subverso_delab
+
+/--
+If the name generator in `ci` is not one with the prefix `delabNamePrefix`, then it is replaced by
+one that does have that prefix.
+-/
+def delabContext (ci : ContextInfo) : ContextInfo :=
+  if ci.ngen.namePrefix == delabNamePrefix then ci
+  else { ci with ngen := { namePrefix := delabNamePrefix } }
 
 /-- A hash of the pretty-printing context of `ci`: its options, namespace, and open declarations. -/
 def ppContextHash (ci : ContextInfo) : UInt64 :=
@@ -104,21 +129,452 @@ def ppContextHash (ci : ContextInfo) : UInt64 :=
     mixHash (hash ci.currNamespace) (hash (toString ci.openDecls))
 
 /--
-A cache key for the rendered types of local variables that tracks the inputs to the rendering process.
+Removes the unique indices that Lean adds to repeated variables.
+
+`Foo.x_2` becomes `Foo.x`, `x_1` becomes `x`. `x5`, `x_`, and `x_1a` are returned unmodified.
 -/
-structure VarTypeKey where
-  /-- The variable's type, fully instantiated -/
-  type : ExprStructEq
-  /-- A hash of the current options, namespace, and open decls -/
+def unsuffixName : Name → Name
+  | .str p s =>
+    let beforeDigits := Compat.String.dropRightWhile s Char.isDigit
+    if beforeDigits.length == s.length || !beforeDigits.endsWith "_" then .str p s
+    else
+      let base := Compat.String.dropRight beforeDigits 1
+      if base.isEmpty then p else .str p base
+  | n => n
+
+/--
+Information about local names that's used for goal rendering and caching.
+
+It's used to compute the local rendering of the name (which takes shadowing into account), the type
+of a name (for hovers), and locals that might shadow constants.
+-/
+structure NameContext where
+  lctx : LocalContext
+  types : HashMap FVarId Expr
+  /--
+  The local names grouped by their unsuffixed base form, so `x`, `x_1`, and `x_12` are in the same
+  bucket.
+  -/
+  byUnsuffix : HashMap Name NameSet
+  /--
+  Local names grouped by their first component, used to check whether a local binding shadows a
+  constant.
+  -/
+  byFirstComponent : HashMap Name NameSet
+
+namespace NameContext
+
+/--
+Constructs a name context from a Lean local context and metavariable context.
+-/
+def ofLocalContext (lctx : LocalContext) (mctx : MetavarContext) : NameContext := Id.run do
+  let mut types : HashMap FVarId Expr := {}
+  let mut byRoot : HashMap Name NameSet := {}
+  let mut byHead : HashMap Name NameSet := {}
+  for d in lctx do
+    let ty := if d.type.hasMVar then (instantiateMVarsCore mctx d.type).1 else d.type
+    types := types.insert d.fvarId ty
+    let root := unsuffixName d.userName
+    byRoot := byRoot.insert root ((byRoot.getD root {}).insert d.userName)
+    let head := d.userName.getRoot
+    byHead := byHead.insert head ((byHead.getD head {}).insert d.userName)
+  return { lctx := lctx, types := types, byUnsuffix := byRoot, byFirstComponent := byHead }
+
+/--
+How to render `x` in this goal.
+-/
+def userName? (ctx : NameContext) (x : FVarId) : Option Name :=
+  (ctx.lctx.find? x).map (·.userName)
+
+/-- The locals that could collide with `unsuffixed`. -/
+def namesWithRoot (ctx : NameContext) (unsuffixed : Name) : NameSet :=
+  ctx.byUnsuffix.getD unsuffixed {}
+
+/-- The locals that have `firstComponent` and could thus interfere with printing a constant. -/
+def namesWithFirstComponent (ctx : NameContext) (firstComponent : Name) : NameSet :=
+  ctx.byFirstComponent.getD firstComponent {}
+
+/--
+The type of `x` in this goal, with metavariables instantiated.
+-/
+def typeOf? (ctx : NameContext) (x : FVarId) : Option Expr :=
+  ctx.types.get? x
+
+def instantiateTypes (ctx : NameContext) (mctx : MetavarContext) : NameContext := Id.run do
+  let mut types := ctx.types
+  for d in ctx.lctx do
+    if d.type.hasMVar then
+      types := types.insert d.fvarId (instantiateMVarsCore mctx d.type).1
+  return { ctx with types := types }
+
+end NameContext
+
+/--
+The names in a term that could affect the way it's printed.
+-/
+structure NameUses where
+  /-- The terms that have been examined already. -/
+  seen : HashSet ExprStructEq := {}
+  /-- The binders of all terms in `seen`, with and without suffixes. -/
+  binders : HashSet Name := {}
+  /--
+  Every component of every constant name in the term.
+
+  `Nat.succ` is saved as `Nat` and `succ`.
+  -/
+  constParts : HashSet Name := {}
+
+namespace NameUses
+
+def addBinder (n : Name) (uses : NameUses) : NameUses :=
+  let n := if n.isAnonymous then `a else n.eraseMacroScopes
+  { uses with binders := uses.binders.insert n |>.insert (unsuffixName n) }
+
+def addConst (c : Name) (uses : NameUses) : NameUses := Id.run do
+  let mut constParts := uses.constParts
+  for part in c.components do
+    constParts := constParts.insert part
+  return { uses with constParts := constParts }
+
+partial def add (e : Expr) (uses : NameUses) : NameUses :=
+  visit e |>.run uses |>.2
+where
+  visit (e : Expr) : StateM NameUses Unit := do
+    if (← get).seen.contains ⟨e⟩ then return
+    modify fun uses => { uses with seen := uses.seen.insert ⟨e⟩ }
+    match e with
+    | .forallE n t b _ | .lam n t b _ =>
+      modify (addBinder n)
+      visit t
+      visit b
+    | .letE n t v b _ =>
+      modify (addBinder n)
+      visit t
+      visit v
+      visit b
+    | .app f a =>
+      visit f
+      visit a
+    | .mdata _ b => visit b
+    | .proj s _ b =>
+      modify (addConst s)
+      visit b
+    | .const .. | .lit .. | .sort .. | .mvar .. | .fvar .. | .bvar .. => pure ()
+
+end NameUses
+
+def sameNames (xs ys : NameSet) : Bool := Id.run do
+  for x in xs do
+    unless ys.contains x do return false
+  for y in ys do
+    unless xs.contains y do return false
+  return true
+
+/--
+A record of a term's rendering dependencies: the things that affect the choice of names shown in the
+term.
+
+This is used to determine whether a cached rendering is still valid.
+-/
+structure TermDeps where
+  /-- The names shown for free variables -/
+  fvars : Array (FVarId × Option Name)
+  /-- Every binder name in the term, combined with the locals that could collide with it. -/
+  binderNames : Array (Name × NameSet)
+  /--
+  Each component of each constant in the term, paired with the locals that could block printing it
+  by a short name and require a `_root_` prefix.
+  -/
+  constNames : Array (Name × NameSet)
+  fvarTypes : Array (FVarId × Expr)
+
+namespace TermDeps
+
+/--
+Computes the rendering dependencies of `roots` in `ctx`.
+
+For a hypothesis `x : T := e`, `ofExprs` would be called with a three element array that contains
+`x`, `T`, and `e` when computing a cache key.
+-/
+def ofExprs (roots : Array Expr) (ctx : NameContext) : Option TermDeps := do
+  let mut exprs := roots
+  let mut rootFVars : CollectFVars.State := {}
+  for e in roots do
+    rootFVars := collectFVars rootFVars e
+  for x in rootFVars.fvarIds do
+    if let some ty := ctx.typeOf? x then
+      unless roots.any (·.equal ty) do
+        exprs := exprs.push ty
+  let mut fvarState : CollectFVars.State := {}
+  let mut uses : NameUses := {}
+  for e in exprs do
+    fvarState := collectFVars fvarState e
+    uses := uses.add e
+    for c in e.getUsedConstants do
+      uses := uses.addConst c
+  let mut fvarTypes := #[]
+  for x in fvarState.fvarIds do
+    if let some ty := ctx.typeOf? x then
+      if ty.hasMVar then failure
+      fvarTypes := fvarTypes.push (x, ty)
+  return {
+    fvars := fvarState.fvarIds.map fun x => (x, ctx.userName? x),
+    fvarTypes,
+    binderNames := uses.binders.toList.toArray.map fun n => (n, ctx.namesWithRoot n),
+    constNames := uses.constParts.toList.toArray.map fun n => (n, ctx.namesWithFirstComponent n)
+  }
+
+/-- Computes the rendering dependencies of `e` in `ctx`. -/
+def ofExpr (e : Expr) (ctx : NameContext) : Option TermDeps :=
+  ofExprs #[e] ctx
+
+/--
+Checks whether the recorded dependencies `deps` of a term are valid in `ctx`.
+
+This determines whether a cached rendering can be reused.
+-/
+def validIn (deps : TermDeps) (ctx : NameContext) : Bool :=
+  deps.fvars.all (fun (x, n) => ctx.userName? x == n) &&
+    deps.binderNames.all (fun (root, ns) => sameNames (ctx.namesWithRoot root) ns) &&
+    deps.constNames.all (fun (head, ns) => sameNames (ctx.namesWithFirstComponent head) ns) &&
+    deps.fvarTypes.all fun (x, ty) =>
+      match ctx.typeOf? x with
+      | some ty' => ty'.equal ty
+      | none => false
+
+end TermDeps
+
+/-- The state of a delayed assignment -/
+structure DelayedState where
+  /-- The variables to abstract over after assignment. -/
+  fvars : Array Expr
+  /-- The metavariable that holds the body to be assigned. -/
+  pending : MVarId
+deriving BEq
+
+/-- The state of an MVar, which may or may not be assigned or delayed. -/
+structure MVarState where
+  mvarId : MVarId
+  assignment? : Option Expr
+  delayed? : Option DelayedState
+deriving BEq
+
+def MVarState.current (mctx : MetavarContext) (m : MVarId) : MVarState where
+  mvarId := m
+  assignment? := mctx.eAssignment.find? m
+  delayed? := mctx.dAssignment.find? m |>.map fun d => {
+    fvars := d.fvars, pending := d.mvarIdPending
+  }
+
+/-- The state of a level metavariable, which may or may not be assigned. -/
+structure LMVarState where
+  lmvarId : LMVarId
+  assignment? : Option Level
+deriving BEq
+
+def LMVarState.current (mctx : MetavarContext) (l : LMVarId) : LMVarState where
+  lmvarId := l
+  assignment? := mctx.lAssignment.find? l
+
+/-- The rendering dependencies of a metavariable that are tracked. -/
+structure MVarDeps where
+  exprs : Array MVarState := #[]
+  levels : Array LMVarState := #[]
+
+namespace MVarDeps
+
+private structure CollectState where
+  seen : HashSet ExprStructEq := {}
+  mvars : HashSet MVarId := {}
+  levelMVars : HashSet LMVarId := {}
+  deps : MVarDeps := {}
+
+private partial def collect (mctx : MetavarContext) (e : Expr) : StateM CollectState Unit :=
+  visit e
+where
+  visit (e : Expr) : StateM CollectState Unit := do
+    unless e.hasMVar do return
+    if (← get).seen.contains ⟨e⟩ then return
+    modify fun s => { s with seen := s.seen.insert ⟨e⟩ }
+    match e with
+    | .mvar m => visitMVar m
+    | .sort u => visitLevel u
+    | .const _ us => for u in us do visitLevel u
+    | .app f a =>
+      visit f
+      visit a
+    | .forallE _ t b _ | .lam _ t b _ =>
+      visit t
+      visit b
+    | .letE _ t v b _ =>
+      visit t
+      visit v
+      visit b
+    | .mdata _ b | .proj _ _ b => visit b
+    | .lit .. | .fvar .. | .bvar .. => pure ()
+  visitMVar (m : MVarId) : StateM CollectState Unit := do
+    if (← get).mvars.contains m then return
+    let state := MVarState.current mctx m
+    modify fun s => { s with
+      mvars := s.mvars.insert m,
+      deps := { s.deps with exprs := s.deps.exprs.push state } }
+    if let some v := state.assignment? then visit v
+    if let some d := state.delayed? then visitMVar d.pending
+  visitLevel (u : Level) : StateM CollectState Unit := do
+    unless u.hasMVar do return
+    match u with
+    | .mvar l =>
+      if (← get).levelMVars.contains l then return
+      let state := LMVarState.current mctx l
+      modify fun s => { s with
+        levelMVars := s.levelMVars.insert l,
+        deps := { s.deps with levels := s.deps.levels.push state } }
+      if let some v := state.assignment? then visitLevel v
+    | .succ v => visitLevel v
+    | .max v w | .imax v w =>
+      visitLevel v
+      visitLevel w
+    | .zero | .param .. => pure ()
+
+def ofLocalContext (lctx : LocalContext) (mctx : MetavarContext) : MVarDeps := Id.run do
+  let mut state : CollectState := {}
+  for d in lctx do
+    if d.type.hasMVar then
+      state := (collect mctx d.type).run state |>.2
+  return state.deps
+
+def ofGoal (decl : MetavarDecl) (mctx : MetavarContext) : MVarDeps := Id.run do
+  let mut state := (collect mctx decl.type).run {} |>.2
+  for d in decl.lctx do
+    state := (collect mctx d.type).run state |>.2
+    if let .ldecl _ _ _ _ value _ _ := d then
+      state := (collect mctx value).run state |>.2
+  return state.deps
+
+def validIn (deps : MVarDeps) (mctx : MetavarContext) : Bool :=
+  deps.exprs.all (fun s => MVarState.current mctx s.mvarId == s) &&
+    deps.levels.all fun s => LMVarState.current mctx s.lmvarId == s
+
+end MVarDeps
+
+def sameLocalDecl : Option LocalDecl → Option LocalDecl → Bool
+  | none, none => true
+  | some (.cdecl _ x n t _ k), some (.cdecl _ x' n' t' _ k') =>
+    x == x' && n == n' && t == t' && k == k'
+  | some (.ldecl _ x n t v nonDep k), some (.ldecl _ x' n' t' v' nonDep' k') =>
+    x == x' && n == n' && t == t' && v == v' && nonDep == nonDep' && k == k'
+  | _, _ => false
+
+/-- The cache key used for rendered goals. -/
+structure GoalDeps where
+  userName : Name
+  type : Expr
+  locals : Array (Option LocalDecl)
+  mvars : MVarDeps
+
+namespace GoalDeps
+
+/-- Gets the cache dependencies of a goal, given its metavariable declaration. -/
+def ofDecl (decl : MetavarDecl) (mctx : MetavarContext) : GoalDeps where
+  userName := decl.userName
+  type := decl.type
+  locals := decl.lctx.decls.toArray
+  mvars := .ofGoal decl mctx
+
+/-- Checks whether a rendered goal cache key matches a given goal and context. -/
+def validIn (deps : GoalDeps) (decl : MetavarDecl) (mctx : MetavarContext) : Bool := Id.run do
+  unless decl.userName == deps.userName && decl.type == deps.type do return false
+  unless decl.lctx.decls.size == deps.locals.size do return false
+  let mut i := 0
+  for d in decl.lctx.decls do
+    unless sameLocalDecl d deps.locals[i]! do return false
+    i := i + 1
+  return deps.mvars.validIn mctx
+
+end GoalDeps
+
+/--
+A key for cached term renderings. It includes the term and a hash of it's pretty-printing context.
+-/
+structure TermKey where
+  expr : ExprStructEq
   ppCtxHash : UInt64
-  /-- The local context (needed for daggering names) -/
-  localNames : List (FVarId × Name)
 deriving BEq, Hashable
 
-def VarTypeKey.forOccurrence (ty : Expr) (lctx : LocalContext) (ci : ContextInfo) : VarTypeKey where
-  type := ⟨ty⟩
-  localNames := lctx.foldl (fun xs d => (d.fvarId, d.userName) :: xs) []
-  ppCtxHash := ppContextHash ci
+/--
+A cache of rendered items along with their term dependencies. Looking up a key in the cache requires
+a name context and returns the first value whose dependency information is satisfied by the context.
+-/
+structure RenderCache (κ : Type) [BEq κ] [Hashable κ] (α : Type) where
+  entries : HashMap κ (Array (TermDeps × α)) := {}
+
+/--
+A mapping from terms and pretty-printing contexts to sets of cached rendering, each with a set of
+dependencies that must be validated before reusing the cached value.
+-/
+abbrev TermCache (α : Type) := RenderCache TermKey α
+
+def maxCandidatesPerKey : Nat := 10
+
+namespace RenderCache
+
+variable [BEq κ] [Hashable κ]
+
+def candidateCount (cache : RenderCache κ α) (key : κ) : Nat :=
+  (cache.entries.getD key #[]).size
+
+/-- Returns the first cache entry for `key` whose term dependencies are satsified in `ctx`. -/
+def get? (cache : RenderCache κ α) (key : κ) (ctx : NameContext) : Option α := do
+  let candidates ← cache.entries.get? key
+  candidates.findSome? fun (deps, v) => if deps.validIn ctx then some v else none
+
+def insert (cache : RenderCache κ α) (key : κ) (deps : TermDeps) (v : α) : RenderCache κ α :=
+  let candidates := cache.entries.getD key #[]
+  let candidates :=
+    if candidates.size < maxCandidatesPerKey then candidates
+    else candidates.extract (candidates.size + 1 - maxCandidatesPerKey) candidates.size
+  { entries := cache.entries.insert key (candidates.push (deps, v)) }
+
+end RenderCache
+
+/-- A cache key used for rendered hypotheses. -/
+structure HypKey where
+  fvarId : FVarId
+  type : ExprStructEq
+  value : Option ExprStructEq
+  ppCtxHash : UInt64
+deriving BEq, Hashable
+
+def HypKey.roots (key : HypKey) : Array Expr :=
+  match key.value with
+  | some value => #[.fvar key.fvarId, key.type.val, value.val]
+  | none => #[.fvar key.fvarId, key.type.val]
+
+structure GoalKey where
+  goal : MVarId
+  ppCtxHash : UInt64
+deriving BEq, Hashable
+
+/-- A cache of rendered proof goals. -/
+structure GoalCache where
+  entries : HashMap GoalKey (Array (GoalDeps × Highlighted.Goal Highlighted)) := {}
+
+namespace GoalCache
+
+def get? (cache : GoalCache) (key : GoalKey) (decl : MetavarDecl) (mctx : MetavarContext) :
+    Option (Highlighted.Goal Highlighted) := do
+  let candidates ← cache.entries.get? key
+  candidates.findSome? fun (deps, goal) => if deps.validIn decl mctx then some goal else none
+
+def insert (cache : GoalCache) (key : GoalKey) (deps : GoalDeps) (goal : Highlighted.Goal Highlighted) :
+    GoalCache :=
+  let candidates := cache.entries.getD key #[]
+  let candidates :=
+    if candidates.size < maxCandidatesPerKey then candidates
+    else candidates.extract (candidates.size + 1 - maxCandidatesPerKey) candidates.size
+  { entries := cache.entries.insert key (candidates.push (deps, goal)) }
+
+end GoalCache
 
 /--
 A cache key for rendered constant signatures that tracks the inputs to the rendering process.
@@ -133,9 +589,10 @@ deriving BEq, Hashable
 structure SigCache where
   signatures : HashMap SigKey (String × FormatWithInfos × ContextInfo)
   /-- Pretty-printed types of local variable occurrences. -/
-  varTypes : HashMap VarTypeKey String := {}
+  varTypes : TermCache String := {}
+  nameContexts : HashMap (UInt64 × List (FVarId × Name × ExprStructEq)) (NameContext × MVarDeps) := {}
 
-instance : EmptyCollection SigCache := ⟨⟨{}, {}⟩⟩
+instance : EmptyCollection SigCache := ⟨⟨{}, {}, {}⟩⟩
 
 structure Context where
   ids : HashMap Lsp.RefIdent Lsp.RefIdent
@@ -145,8 +602,29 @@ structure Context where
   /-- Whether to collect `Std.Format` data for reflowable rendering. -/
   collectFormat : Bool := false
   sigCache : IO.Ref SigCache
+  timings? : Option (IO.Ref Timings) := none
 
 def Context.noDefinitions (ctxt : Context) : Context := {ctxt with definitionsPossible := false}
+
+/-- Runs `act`, attributing its time usage to category `c`. -/
+@[inline]
+def withCategory [Monad m] [MonadReaderOf Context m] [MonadLiftT IO m] [MonadExcept ε m]
+    (c : Category) (act : m α) : m α := do
+  match (← readThe Context).timings? with
+  | none => act
+  | some ref =>
+    let depth ← (enter ref c : IO Nat)
+    let r ← tryCatch act fun e => do
+      (exit ref depth : IO Unit)
+      throw e
+    (exit ref depth : IO Unit)
+    pure r
+
+/-- Increments the indicated count. -/
+@[inline]
+def count [Monad m] [MonadReaderOf Context m] [MonadLiftT IO m] (c : Counter) : m Unit := do
+  if let some ref := (← readThe Context).timings? then
+    (ref.modify (·.bump c) : IO Unit)
 
 partial def Token.Kind.priority : Token.Kind → Nat
   | .var .. => 2
@@ -217,6 +695,25 @@ def ppCodeWithInfos (e : Expr) : MetaM CodeWithInfos:= do
         pure <| .append <| e.prettyM (m := PrettyM) Std.Format.defWidth |>.run {} |>.2.out
       catch
       | _ => pure <| .text e.dbgToString
+
+/--
+Pretty prints a term once, returning both code for static highlights and a pretty printer document.
+-/
+def ppCodeAndFormatWithInfos (e : Expr) : MetaM (CodeWithInfos × FormatWithInfos) := do
+  let e ← instantiateMVars e
+  let fi ← PrettyPrinter.ppExprWithInfos e
+  if pp.raw.get (← getOptions) then
+    return (← ppCodeWithInfos e, fi)
+  let ctx : ContextInfo := {
+    env := ← getEnv
+    mctx := ← getMCtx
+    options := ← getOptions
+    currNamespace := ← getCurrNamespace
+    openDecls := ← getOpenDecls
+    fileMap := default
+    ngen := ← getNGen
+  }
+  return (← Compat.tagCodeInfos ctx fi.infos (TaggedText.prettyTagged fi.fmt), fi)
 
 end
 
@@ -626,14 +1123,16 @@ structure HighlightState where
   /-- Memoized results of searching for tactic info in children (by canonical range) -/
   childHasTacticCache : Compat.HashMap Compat.Syntax.Range (Array (Syntax × Bool)) := {}
   /-- Cached already-rendered terms from hovers and proof states. -/
-  terms : Compat.HashMap Expr Highlighted := {}
+  terms : TermCache Highlighted := {}
   /-- Cached already-rendered terms from hovers and proof states, in an intermediate state -/
-  ppTerms : Compat.HashMap Expr CodeWithInfos := {}
-  /-- Cached format data for terms (when `collectFormat` is true). -/
-  fmtTerms : Compat.HashMap Expr String := {}
+  ppTerms : TermCache CodeWithInfos := {}
+  /-- Cached rendered terms -/
+  fmtTerms : TermCache (Highlighted × String) := {}
+  goals : GoalCache := {}
+  hyps : RenderCache HypKey (Highlighted.Hypothesis Highlighted) := {}
 
 
-instance : Inhabited HighlightState := ⟨default, default, default, default, {}, {}, {}, {}, {}⟩
+instance : Inhabited HighlightState := ⟨default, default, default, default, {}, {}, {}, {}, {}, {}, {}⟩
 
 def HighlightState.empty : HighlightState where
   messages := #[]
@@ -641,7 +1140,7 @@ def HighlightState.empty : HighlightState where
   output := []
 
 def HighlightState.resetCache (st : HighlightState) : HighlightState :=
-  { st with terms := {}, ppTerms := {}, fmtTerms := {} }
+  { st with terms := {}, ppTerms := {}, fmtTerms := {}, goals := {}, hyps := {} }
 
 def HighlightState.ofMessages [Monad m] [MonadFileMap m]
     (stx : Syntax) (messages : Array Message)
@@ -716,22 +1215,58 @@ private def leanPosToUtf8Pos (text : FileMap) : Position → Compat.String.Pos :
 abbrev KindWithPPSig := Token.Kind × Option (FormatWithInfos × ContextInfo)
 
 /--
-Finds the appropriate token kind for a token whose meaning is the expression `expr`. When
-`collectFormat` is true, also returns the `FormatWithInfos` to be saved as a reflowable type or
-signature.
+A token kind that might be chosen together with a procedure for rendering it.
+
+Because tokens contain rendered output, and a given syntactic token may have multiple potential
+renderings which are chosen based on priority, it's wasteful to compute all the details ahead of
+time.
 -/
-def exprKind [Monad m] [MonadReaderOf Context m] [MonadEnv m] [MonadLiftT IO m] [MonadExcept ε m] [MonadMCtx m]
-    (ci : ContextInfo) (lctx : LocalContext) (stx? : Option Syntax) (expr : Expr)
-    (allowUnknownTyped : Bool := false) :
-    m (Option KindWithPPSig) := do
+structure KindCandidate (m : Type → Type) where
+  shape : Token.Kind
+  render : m (Option KindWithPPSig)
+
+/--
+A token kind candidate whose rendered information is already ready and doesn't need further
+computation.
+-/
+def KindCandidate.ready [Monad m] (kind : Token.Kind) : KindCandidate m :=
+  ⟨kind, pure (some (kind, none))⟩
+
+def tokenNameContext [Monad m] [MonadReaderOf Context m] [MonadLiftT IO m]
+    (ci : ContextInfo) (lctx : LocalContext) (ppCtxHash : UInt64) : m NameContext := do
   let cache : IO.Ref _ := (← read).sigCache
-  let runMeta {α} (act : MetaM α) (env := ci.env) (lctx := lctx) : m α := {ci with env := env}.runMetaM lctx act
+  let key := (ppCtxHash, lctx.foldl (fun xs d => (d.fvarId, d.userName, ⟨d.type⟩) :: xs) [])
+  let names ←
+    match Compat.HashMap.get? (← (cache.get : IO _)).nameContexts key with
+    | some (names, deps) =>
+      if deps.validIn ci.mctx then return names
+      pure (names.instantiateTypes ci.mctx)
+    | none =>
+      let sanitized := lctx.sanitizeNames.run' { options := ci.options }
+      pure (.ofLocalContext sanitized ci.mctx)
+  let deps := MVarDeps.ofLocalContext names.lctx ci.mctx
+  (cache.modify (fun c => { c with nameContexts := c.nameContexts.insert key (names, deps) }) : IO _)
+  return names
+
+open TermDeps in
+/-- Determines a kind candidate for a token whose meaning is `expr` according to the info tree. -/
+def exprKindCandidate [Monad m] [MonadReaderOf Context m] [MonadEnv m] [MonadLiftT IO m] [MonadExcept ε m] [MonadMCtx m]
+    (ci : ContextInfo) (lctx : LocalContext) (getNames : UInt64 → m NameContext) (stx? : Option Syntax) (expr : Expr)
+    (allowUnknownTyped : Bool := false) :
+    m (Option (KindCandidate m)) := do
+  let ci := delabContext ci
+  let cache : IO.Ref _ := (← read).sigCache
+  let runMeta {α} (act : MetaM α) (env := ci.env) (lctx := lctx) : m α := do
+    count .runMetaMCalls
+    {ci with env := env}.runMetaM lctx act
   let doCollect := (← readThe Context).collectFormat
   -- Print the signature in an empty local context to avoid local auxiliary definitions from
   -- elaboration, which may otherwise shadow in recursive occurrences, leading to spurious `_root_.`
-  -- qualifiers. Returns (sigString, sigOrType?) — the second projection is a pretty-printed
-  -- signature for later resolution by identKind.
-  let ppSig (x : Name) :  m (String × Option (FormatWithInfos × ContextInfo)) := do
+  -- qualifiers. Returns a signature string together with a pretty printed signature for later
+  -- resolution by identKind (with both the formatted document and the ContextInfo within which it's
+  -- resolved by identKind)
+  let ppSig (x : Name) :  m (String × Option (FormatWithInfos × ContextInfo)) :=
+    withCategory .signatures do
     let env := constEnv ci.env (← getEnv) x
     let key : SigKey := ⟨x, ppContextHash ci⟩
     let (sigStr, sig, ci) ←
@@ -739,9 +1274,12 @@ def exprKind [Monad m] [MonadReaderOf Context m] [MonadEnv m] [MonadLiftT IO m] 
         pure sigDoc
       else
         let (sig, ci) ← do
-          let sig ← runMeta (env := env) (lctx := {}) <|
-            withOptions (·.set `pp.tagAppFns true) (PrettyPrinter.ppSignature x)
-          pure (sig, { ci with env := env })
+          count .delaboratorCalls
+          let (sig, ngen) ← runMeta (env := env) (lctx := {}) <|
+            withOptions (·.set `pp.tagAppFns true) do
+              let sig ← PrettyPrinter.ppSignature x
+              pure (sig, ← getNGen)
+          pure (sig, { ci with env := env, ngen := ngen })
 
         let sigStr := toString (← stripNamespaces sig)
         (cache.modify (fun c => { c with signatures := c.signatures.insert key (sigStr, sig, ci) }) : IO _)
@@ -750,113 +1288,165 @@ def exprKind [Monad m] [MonadReaderOf Context m] [MonadEnv m] [MonadLiftT IO m] 
 
   -- Pretty-print `ty` in this occurrence's context.
   let ppType (ty : Expr) : m (String × Option (FormatWithInfos × ContextInfo)) := do
+    count .delaboratorCalls
     try
       if doCollect then
-        let fi ← runMeta <| withOptions (·.set `pp.tagAppFns true) <|
-          PrettyPrinter.ppExprWithInfos ty
-        pure (toString fi.fmt, some (fi, ci))
+        let (fi, ngen) ← runMeta <| withOptions (·.set `pp.tagAppFns true) do
+          let fi ← PrettyPrinter.ppExprWithInfos ty
+          pure (fi, ← getNGen)
+        pure (toString fi.fmt, some (fi, { ci with ngen := ngen }))
       else
         let fmt ← runMeta <| Meta.ppExpr ty
         pure (toString fmt, none)
     catch _ => pure ("", none)
 
-  -- The fully instantiated inferred type of `expr`, or `none` if inference fails.
+  -- The fully instantiated inferred type of `expr`, or `none` if inference fails.  If `expr` is a
+  -- free variable, its type can be read directly from the local context.
   let typeOf : m (Option Expr) := do
+    if let .fvar x := expr.consumeMData then
+      return lctx.find? x |>.map fun decl =>
+        if decl.type.hasMVar then (instantiateMVarsCore ci.mctx decl.type).1 else decl.type
     try
       runMeta do pure (some (← instantiateMVars (← Meta.inferType expr)))
     catch _ => pure none
 
   -- Pretty-print the inferred type of `expr` (a variable, or any expression whose kind is otherwise
   -- unknown).
-  let ppTermType : m (String × Option (FormatWithInfos × ContextInfo)) := do
+  let ppTermType : m (String × Option (FormatWithInfos × ContextInfo)) :=
+    withCategory .withType do
     match ← typeOf with
     | some ty => ppType ty
     | none => pure ("", none)
 
-  -- Cache the rendered types of variables: occurrences of local variables with the same type,
-  -- local names, and pretty-printing context render identically, so the delaboration work can be
-  -- shared. Types that still contain metavariables render fresh each time (a later occurrence may
-  -- print further instantiated), as does everything when collecting format data (the cached
-  -- string has no format payload).
-  let ppVarType : m (String × Option (FormatWithInfos × ContextInfo)) := do
+  let ppVarType : m (String × Option (FormatWithInfos × ContextInfo)) :=
+    withCategory .variableTypes do
     match ← typeOf with
     | none => pure ("", none)
     | some ty =>
       if doCollect || ty.hasMVar || ty.hasLevelMVar then
         ppType ty
       else
-        let key := VarTypeKey.forOccurrence ty lctx ci
-        match Compat.HashMap.get? (← (cache.get : IO _)).varTypes key with
-        | some tyStr => pure (tyStr, none)
+        let ppCtxHash := ppContextHash ci
+        let key : TermKey := { expr := ty, ppCtxHash := ppCtxHash }
+        let names ← getNames ppCtxHash
+        match (← (cache.get : IO _)).varTypes.get? key names with
+        | some tyStr =>
+          count .varTypeCacheHits
+          pure (tyStr, none)
         | none =>
+          count .varTypeCacheMisses
           let (tyStr, prettySig) ← ppType ty
-          (cache.modify (fun c => { c with varTypes := c.varTypes.insert key tyStr }) : IO _)
+          let some deps := ofExpr ty names
+            | pure (tyStr, prettySig)
+          if (← (cache.get : IO _)).varTypes.candidateCount key ≥ maxCandidatesPerKey then
+            count .varTypeCacheEvictions
+          (cache.modify (fun c => { c with varTypes := c.varTypes.insert key deps tyStr }) : IO _)
           pure (tyStr, prettySig)
 
-  let rec findKind e := do
+  let rec findKind (e : Expr) : m (Option (KindCandidate m)) := do
     match e with
     | Expr.fvar id =>
       if let some y := (← read).ids[(← Compat.mkRefIdentFVar id)]? then
-        Compat.refIdentCase y
-          (onFVar := fun x => do
-            let (tyStr, prettySig) ← ppVarType
-            if let some localDecl := lctx.find? x then
-              if localDecl.isAuxDecl then
+        return some <| Compat.refIdentCase y
+          (onFVar := fun x =>
+            if (lctx.find? x).any (·.isAuxDecl) then
+              ⟨.const x.name "" none false none, do
+                let (tyStr, _) ← ppVarType
+                count .delaboratorCalls
                 let e ← runMeta <| Meta.ppExpr expr
                 -- FIXME the mkSimple is a bit of a kludge
-                return some (.const (.mkSimple (toString e)) tyStr none false none, none)
-            return some (.var x tyStr none, prettySig))
-          (onConst := fun x => do
-            let (sig, prettySig) ← ppSig x
-            let docs ← findDocString? (constEnv ci.env (← getEnv) x) x
-            return some (.const x sig docs false none, prettySig))
+                return some (.const (.mkSimple (toString e)) tyStr none false none, none)⟩
+            else
+              ⟨.var x "" none, do
+                let (tyStr, prettySig) ← ppVarType
+                return some (.var x tyStr none, prettySig)⟩)
+          (onConst := fun x =>
+            ⟨.const x "" none false none, do
+              let (sig, prettySig) ← ppSig x
+              let docs ← findDocString? (constEnv ci.env (← getEnv) x) x
+              return some (.const x sig docs false none, prettySig)⟩)
       else
-        let (tyStr, prettySig) ← ppVarType
-        return some (.var id tyStr none, prettySig)
+        return some ⟨.var id "" none, do
+          let (tyStr, prettySig) ← ppVarType
+          return some (.var id tyStr none, prettySig)⟩
     | Expr.const name _ =>
-      let docs ← findDocString? (constEnv ci.env (← getEnv) name) name
-      let (sig, prettySig) ← ppSig name
-      return some (.const name sig docs false none, prettySig)
+      return some ⟨.const name "" none false none, do
+        let docs ← findDocString? (constEnv ci.env (← getEnv) name) name
+        let (sig, prettySig) ← ppSig name
+        return some (.const name sig docs false none, prettySig)⟩
     | Expr.sort _ =>
       if let some stx := stx? then
         let k := stx.getKind
         let docs? ← findDocString? (← getEnv) k
-        return some (.sort docs?, none)
-      else return some (.sort none, none)
-    | Expr.lit (.strVal s) => return some (.str (some s) false, none)
+        return some (.ready (.sort docs?))
+      else return some (.ready (.sort none))
+    | Expr.lit (.strVal s) => return some (.ready (.str (some s) false))
     | Expr.mdata _ e =>
       findKind e
     | _other =>
       if allowUnknownTyped then
-        let (tyStr, prettySig) ← ppTermType
-        if tyStr.isEmpty then return none else return some (.withType tyStr, prettySig)
+        return some ⟨.withType "", do
+          let (tyStr, prettySig) ← ppTermType
+          if tyStr.isEmpty then return none else return some (.withType tyStr, prettySig)⟩
       else
         return none
 
   findKind (← instantiateMVars expr)
+
+/--
+Finds the appropriate token kind for a token whose meaning is the expression `expr`. When
+`collectFormat` is true, also returns the `FormatWithInfos` to be saved as a reflowable type or
+signature.
+-/
+def exprKind [Monad m] [MonadReaderOf Context m] [MonadEnv m] [MonadLiftT IO m] [MonadExcept ε m] [MonadMCtx m]
+    (ci : ContextInfo) (lctx : LocalContext) (getNames : UInt64 → m NameContext) (stx? : Option Syntax) (expr : Expr)
+    (allowUnknownTyped : Bool := false) :
+    m (Option KindWithPPSig) := do
+  let some candidate ← exprKindCandidate ci lctx getNames stx? expr (allowUnknownTyped := allowUnknownTyped)
+    | return none
+  candidate.render
+
+def termInfoKindCandidate
+    [Monad m] [MonadReaderOf Context m]
+    [MonadFileMap m] [MonadEnv m] [MonadFinally m] [MonadLiftT IO m] [MonadExcept ε m] [MonadMCtx m]
+    (ci : ContextInfo) (termInfo : TermInfo) (allowUnknownTyped : Bool := false) :
+    m (Option (KindCandidate m)) := do
+  let some candidate ←
+      exprKindCandidate ci termInfo.lctx (tokenNameContext ci termInfo.lctx) termInfo.stx termInfo.expr
+        (allowUnknownTyped := allowUnknownTyped)
+    | return none
+  if !(← read).definitionsPossible then return some candidate
+  return some { candidate with
+    render := do
+      let k ← candidate.render
+      if let some (.const name sig docs _isDef pp?, prettySig) := k then
+        let isDef ← withEnv (constEnv ci.env (← getEnv) name) <| isDefinition name termInfo.stx
+        return some (.const name sig docs isDef pp?, prettySig)
+      return k }
 
 def termInfoKind
     [Monad m] [MonadReaderOf Context m]
     [MonadFileMap m] [MonadEnv m] [MonadFinally m] [MonadLiftT IO m] [MonadExcept ε m] [MonadMCtx m]
     (ci : ContextInfo) (termInfo : TermInfo) (allowUnknownTyped : Bool := false) :
     m (Option KindWithPPSig) := do
-  let k ← exprKind ci termInfo.lctx termInfo.stx termInfo.expr (allowUnknownTyped := allowUnknownTyped)
-  if (← read).definitionsPossible then
-    if let some (.const name sig docs _isDef pp?, prettySig) := k then
-      let isDef ← withEnv (constEnv ci.env (← getEnv) name) <| isDefinition name termInfo.stx
-      return some (.const name sig docs isDef pp?, prettySig)
-  return k
+  let some candidate ← termInfoKindCandidate ci termInfo (allowUnknownTyped := allowUnknownTyped)
+    | return none
+  candidate.render
 
-def infoKind [Monad m] [MonadReaderOf Context m]
+def infoKindCandidate [Monad m] [MonadReaderOf Context m]
     [MonadFileMap m] [MonadEnv m] [MonadFinally m] [MonadLiftT IO m] [MonadExcept ε m] [MonadMCtx m]
     (ci : ContextInfo) (info : Info) (allowUnknownTyped : Bool := false) :
-    m (Option KindWithPPSig) := do
+    m (Option (KindCandidate m)) := do
   match info with
-    | .ofTermInfo termInfo => termInfoKind ci termInfo (allowUnknownTyped := allowUnknownTyped)
-    | .ofFieldInfo fieldInfo => return some (← fieldInfoKind ci fieldInfo, none)
+    | .ofTermInfo termInfo => termInfoKindCandidate ci termInfo (allowUnknownTyped := allowUnknownTyped)
+    | .ofFieldInfo fieldInfo =>
+      return some ⟨.const fieldInfo.projName "" none false none, do
+        count .runMetaMCalls
+        count .delaboratorCalls
+        return some (← fieldInfoKind ci fieldInfo, none)⟩
     | .ofOptionInfo oi =>
       let doc := (← getOptionDecls).find? oi.optionName |>.map (·.descr)
-      pure <| some (.option oi.optionName oi.declName doc, none)
+      pure <| some (.ready (.option oi.optionName oi.declName doc))
     | .ofCompletionInfo _ => pure none
     | .ofTacticInfo _ => pure none
     | .ofCommandInfo _ => pure none
@@ -864,6 +1454,14 @@ def infoKind [Monad m] [MonadReaderOf Context m]
     | .ofUserWidgetInfo _ => pure none
     | _ =>
       pure none
+
+def infoKind [Monad m] [MonadReaderOf Context m]
+    [MonadFileMap m] [MonadEnv m] [MonadFinally m] [MonadLiftT IO m] [MonadExcept ε m] [MonadMCtx m]
+    (ci : ContextInfo) (info : Info) (allowUnknownTyped : Bool := false) :
+    m (Option KindWithPPSig) := do
+  let some candidate ← infoKindCandidate ci info (allowUnknownTyped := allowUnknownTyped)
+    | return none
+  candidate.render
 
 /--
 All info nodes whose canonical span matches `stx`, via the pre-built range index when `stx` has a
@@ -878,22 +1476,41 @@ def infoNodesFor (trees : Array InfoTree) (stx : Syntax) :
     (infoForSyntax t stx).toArray.map fun (ci, info) =>
       { ci, info, commandEnv := commandEnv?.getD ci.env }
 
+def withCommandEnv (trees : Array InfoTree) (stx : Syntax) (act : HighlightM α) : HighlightM α := do
+  if let some node := (← infoNodesFor trees stx)[0]? then
+    withEnv node.commandEnv act
+  else
+    act
+
+def kindCandidatesByPriority
+    (trees : Array InfoTree) (stx : Syntax) (allowUnknownTyped : Bool := false) :
+    HighlightM (Array (Environment × KindCandidate HighlightM)) := do
+  let mut candidates := #[]
+  for { ci, commandEnv, info } in (← infoNodesFor trees stx) do
+    if let some candidate ←
+        withEnv commandEnv (infoKindCandidate ci info (allowUnknownTyped := allowUnknownTyped)) then
+      candidates := candidates.push (commandEnv, candidate)
+  return candidates.insertionSort (·.2.shape.priority > ·.2.shape.priority)
+
 def anonCtorKind
     (trees : Array InfoTree) (stx : Syntax) :
     HighlightM (Option Token.Kind) := do
-  let mut kind : Token.Kind := .unknown
-  for node in (← infoNodesFor trees stx) do
-    if let some (seen, _) ← withEnv node.commandEnv (infoKind node.ci node.info) then
-      if seen.priority > kind.priority then kind := seen
-    else continue
-  return match kind with
-  | .const n sig doc? _ ppSig? => some <| .anonCtor n sig doc? ppSig?
-  | .anonCtor .. => some kind
-  | _ => none
+  for (commandEnv, candidate) in ← kindCandidatesByPriority trees stx do
+    match candidate.shape with
+    | .const .. | .anonCtor .. =>
+      let some (kind, _) ← withEnv commandEnv candidate.render
+        | continue
+      return match kind with
+      | .const n sig doc? _ ppSig? => some <| .anonCtor n sig doc? ppSig?
+      | .anonCtor .. => some kind
+      | _ => none
+    | _ => return none
+  return none
 
 partial def renderTagged [Monad m] [MonadReaderOf Context m]
     [MonadFileMap m] [MonadEnv m] [MonadFinally m] [MonadLiftT IO m] [MonadExcept ε m] [MonadMCtx m]
-    (outer : Option Token.Kind) (doc : CodeWithInfos) :
+    (outer : Option Token.Kind) (doc : CodeWithInfos)
+    (tagEnv : ContextInfo → Environment → Environment := fun _ env => env) :
     m Highlighted := do
   match doc with
   | .text txt => do
@@ -927,6 +1544,7 @@ partial def renderTagged [Monad m] [MonadReaderOf Context m]
     pure toks
   | .tag t doc' =>
     let {ctx, info, children := _} := t.info.val
+    withEnv (tagEnv ctx (← getEnv)) do
     if let .text tok := doc' then
       let wsPre := Compat.String.takeWhile tok (·.isWhitespace)
       let wsPost := Compat.String.takeRightWhile tok (·.isWhitespace)
@@ -934,8 +1552,8 @@ partial def renderTagged [Monad m] [MonadReaderOf Context m]
       pure <| .seq #[.text wsPre, .token ⟨k, Compat.String.trim tok⟩, .text wsPost]
     else
       let k? := (← infoKind ctx info).map (·.1)
-      renderTagged k? doc'
-  | .append xs => xs.mapM (renderTagged outer) <&> (·.foldl (init := .empty) (· ++ ·))
+      renderTagged k? doc' tagEnv
+  | .append xs => xs.mapM (renderTagged outer · tagEnv) <&> (·.foldl (init := .empty) (· ++ ·))
 where
   tokenEnder str := str.isEmpty || !(Compat.String.Pos.get str 0 |>.isAlphanum)
 
@@ -951,7 +1569,7 @@ section Compat
 partial def messageContents
     (message : Message) (highlightTerms : Bool := true) :
     HighlightM (Highlighted.MessageContents Highlighted) := do
-  withOptions (pp.sanitizeNames.set · true) do
+  withCategory .messages <| withOptions (pp.sanitizeNames.set · true) do
     let head := if message.caption != "" then message.caption ++ ":\n" else ""
     let body ←
       withOptions (·.set `pp.tagAppFns true) do
@@ -963,9 +1581,9 @@ where
     | .text str => pure (.text str)
     | .append xs => .append <$> xs.mapM convert
     | .tag embed _ =>
-      let render (e : CodeWithInfos) : HighlightM Highlighted  :=
+      let render (e : CodeWithInfos) : HighlightM Highlighted :=
         if highlightTerms then
-          try renderTagged none e
+          try renderTagged none e (tagEnv := fun ctx _ => ctx.env)
           catch | _ => pure <| .text e.pretty
         else
           pure <| .text e.pretty
@@ -1321,7 +1939,7 @@ def hasTactics (stx : Syntax) : HighlightM Bool := do
         if stx' == stx then return res
 
   if let some info := (← readThe InfoTable).tacticInfo? stx then
-    for (_, ti) in info do
+    for (_, ti, _) in info do
       if ti.stx == stx then
         if let some rng := rng? then
           modify fun st =>
@@ -1372,29 +1990,33 @@ partial def _root_.Lean.Widget.TaggedText.indent (doc : TaggedText α) : TaggedT
     | .append docs => .append (docs.map indent')
   .append #[.text "  ", indent' doc]
 
-/--
-Returns the highlighted version of `key`, if it exists in the cache; uses `render` to highlight
-`key` if not and saves it in the cache.
--/
-def renderOrGet (key : Expr) (render : Expr → HighlightM Highlighted) : HighlightM Highlighted := do
-  if let some hl := (← get).terms.get? key then
-    return hl
-  else
-    let hl ← render key
-    modify fun st => { st with terms := st.terms.insert key hl }
-    return hl
+open TermDeps in
+@[specialize]
+def cachedTerm
+    (cache : HighlightState → TermCache α) (setCache : HighlightState → TermCache α → HighlightState)
+    (key : TermKey) (ctx : NameContext) (render : Expr → HighlightM α) : HighlightM α := do
+  if key.expr.val.hasMVar then
+    count .termCacheUncached
+    return ← render key.expr.val
+  if let some v := (cache (← get)).get? key ctx then
+    count .termCacheHits
+    return v
+  count .termCacheMisses
+  let v ← render key.expr.val
+  let some deps := ofExpr key.expr.val ctx
+    | return v
+  if (cache (← get)).candidateCount key ≥ maxCandidatesPerKey then
+    count .termCacheEvictions
+  modify fun st => setCache st ((cache st).insert key deps v)
+  return v
 
-/--
-Returns the pretty-printed version of `key`, if it exists in the cache; uses `render` to
-pretty-print `key` if not and saves it in the cache.
--/
-def renderOrGetCodeWithInfos (key : Expr) (render : Expr → HighlightM CodeWithInfos) : HighlightM CodeWithInfos := do
-  if let some tm := (← get).ppTerms.get? key then
-    return tm
-  else
-    let tm ← render key
-    modify fun st => { st with ppTerms := st.ppTerms.insert key tm }
-    return tm
+def renderOrGet (key : TermKey) (ctx : NameContext) (render : Expr → HighlightM Highlighted) :
+    HighlightM Highlighted :=
+  cachedTerm (·.terms) (fun st c => { st with terms := c }) key ctx render
+
+def renderOrGetCodeWithInfos (key : TermKey) (ctx : NameContext) (render : Expr → HighlightM CodeWithInfos) :
+    HighlightM CodeWithInfos :=
+  cachedTerm (·.ppTerms) (fun st c => { st with ppTerms := c }) key ctx render
 
 
 /--
@@ -1465,22 +2087,16 @@ def identKind
     (trees : Array InfoTree) (stx : TSyntax `ident)
     (allowUnknownTyped : Bool := false) :
     HighlightM Token.Kind := do
-  let mut kind : Token.Kind := .unknown
-  -- Formatted signature or type from the winning exprKind call, to be resolved after the loop.
-  let mut kindSig : Option (FormatWithInfos × ContextInfo) := none
-  for { ci, commandEnv, info } in (← infoNodesFor trees stx) do
-    if let some (seen, prettySig) ←
-        withEnv commandEnv (infoKind ci info (allowUnknownTyped := allowUnknownTyped)) then
-      if seen.priority > kind.priority then
-        kind := seen
-        kindSig := prettySig
-    else continue
-  match kind with
-  | .const name sig docs isDef none =>
-    return .const name sig docs isDef (← resolveFormatWithInfos kindSig)
-  | .var id tyStr none =>
-    return .var id tyStr (← resolveFormatWithInfos kindSig)
-  | _ => pure kind
+  for (commandEnv, candidate) in ← kindCandidatesByPriority trees stx allowUnknownTyped do
+    let some (kind, kindSig) ← withEnv commandEnv candidate.render
+      | continue
+    match kind with
+    | .const name sig docs isDef none =>
+      return .const name sig docs isDef (← withEnv commandEnv (resolveFormatWithInfos kindSig))
+    | .var id tyStr none =>
+      return .var id tyStr (← withEnv commandEnv (resolveFormatWithInfos kindSig))
+    | _ => return kind
+  return .unknown
 
 /--
 The inferred type of a literal (e.g. a numeral), as a pretty-printed string and optional reflowable
@@ -1492,38 +2108,64 @@ def literalType (trees : Array Lean.Elab.InfoTree) (stx : Syntax) :
   for { ci, info, commandEnv } in (← infoNodesFor trees stx) do
     -- `exprKind` (with `allowUnknownTyped`) reports a non-`const`/`var`/`sort`/`str` expression —
     -- which a numeral's `OfNat.ofNat …`/literal application is — as `.withType <type>`.
-    if let some (.withType ty, prettySig) ←
-        withEnv commandEnv (infoKind ci info (allowUnknownTyped := true)) then
-      return (some ty, ← resolveFormatWithInfos prettySig)
+    let some candidate ← withEnv commandEnv (infoKindCandidate ci info (allowUnknownTyped := true))
+      | continue
+    let .withType .. := candidate.shape | continue
+    if let some (.withType ty, prettySig) ← withEnv commandEnv candidate.render then
+      return (some ty, ← withEnv commandEnv (resolveFormatWithInfos prettySig))
   return (none, none)
 
-/-- Returns the format data JSON for `key` from the cache, or computes and caches it. -/
-def renderOrGetFormat (key : Expr) (render : Expr → HighlightM String) : HighlightM (Option String) := do
-  if !(← read).collectFormat then return none
-  if let some fmtStr := (← get).fmtTerms.get? key then
-    return some fmtStr
-  else
-    let fmtStr ← render key
-    modify fun st => { st with fmtTerms := st.fmtTerms.insert key fmtStr }
-    return some fmtStr
+/-- Render a term, caching it. -/
+def renderOrGetWithFormat (key : TermKey) (ctx : NameContext)
+    (render : Expr → HighlightM (Highlighted × String)) : HighlightM (Highlighted × String) :=
+  cachedTerm (·.fmtTerms) (fun st c => { st with fmtTerms := c }) key ctx render
 
-/-- Pretty-print an expression and return the format data JSON string (format tree + annotations). -/
-def ppFormatData (e : Expr) (ci : ContextInfo) (runMeta : MetaM FormatWithInfos → HighlightM FormatWithInfos)
-    : HighlightM String := do
-  let fi ← runMeta <| withOptions (·.set `pp.tagAppFns true) do
-    let e ← instantiateMVars e
-    PrettyPrinter.ppExprWithInfos e
-  let (fmt', annots) ← resolveFormatAnnotations fi.fmt fi.infos ci
-  pure (formatDataToJson fmt' annots)
+def showsMVars (mctx : MetavarContext) (names : NameContext) (conclusion : Expr) : Bool := Id.run do
+  if conclusion.hasMVar then return true
+  for decl in names.lctx do
+    if (names.typeOf? decl.fvarId |>.getD decl.type).hasMVar then return true
+    if let .ldecl _ _ _ _ value false _ := decl then
+      if (instantiateMVarsCore mctx value).1.hasMVar then return true
+  return false
 
-def highlightGoals (ci : ContextInfo) (goals : List MVarId) :
-    HighlightM (Array (Highlighted.Goal Highlighted)) := withReader (·.noDefinitions) do
+open TermDeps in
+/--
+Looks up a hypothesis key, returning the cached value if found. If not, it creates and caches the
+highlighted hypothesis using `render`.
+-/
+def cachedHypothesis (key : HypKey) (ctx : NameContext)
+    (render : HighlightM (Highlighted.Hypothesis Highlighted)) :
+    HighlightM (Highlighted.Hypothesis Highlighted) := do
+  let roots := key.roots
+  if roots.any (·.hasMVar) then
+    count .hypCacheUncached
+    return ← render
+  if let some hyp := (← get).hyps.get? key ctx then
+    count .hypCacheHits
+    return hyp
+  count .hypCacheMisses
+  let hyp ← render
+  let some deps := ofExprs roots ctx
+    | return hyp
+  if (← get).hyps.candidateCount key ≥ maxCandidatesPerKey then
+    count .hypCacheEvictions
+  modify fun st => { st with hyps := st.hyps.insert key deps hyp }
+  return hyp
+
+def highlightGoals (ci : ContextInfo) (commandEnv : Environment) (goals : List MVarId) :
+    HighlightM (Array (Highlighted.Goal Highlighted)) := withEnv commandEnv <| withReader (·.noDefinitions) do
   let mut goalView := #[]
   let doCollectFormat := (← read).collectFormat
+  let ppCtxHash := ppContextHash ci
   for g in goals do
     let mut hyps := #[]
     let some mvDecl := ci.mctx.findDecl? g
       | continue
+    let goalKey : GoalKey := { goal := g, ppCtxHash }
+    if let some goal := (← get).goals.get? goalKey mvDecl ci.mctx then
+      count .goalCacheHits
+      goalView := goalView.push goal
+      continue
     let name := if mvDecl.userName.isAnonymous then none else some mvDecl.userName.eraseMacroScopes.toString
     let lctx := mvDecl.lctx |>.sanitizeNames.run' {options := (← getOptions)}
 
@@ -1531,58 +2173,84 @@ def highlightGoals (ci : ContextInfo) (goals : List MVarId) :
     -- functions have no tooltips or binding info in tactics.
     -- cf https://leanprover.zulipchat.com/#narrow/stream/270676-lean4/topic/Function.20application.20delaboration/near/265800665
     let maxHeartbeats : Nat := (← getNatOption `maxHeartbeats)
-    let ci' := { ci with options :=
-        ci.options |>.set `pp.tagAppFns true |>.set `maxHeartbeats maxHeartbeats
-      }
-    let runMeta {α} (act : MetaM α) : HighlightM α := ci'.runMetaM lctx act
+    let options := ci.options |>.set `pp.tagAppFns true |>.set `maxHeartbeats maxHeartbeats
+    let ci' := delabContext { ci with options }
+    let runMeta {α} (act : MetaM α) : HighlightM α := do
+      count .runMetaMCalls
+      ci'.runMetaM lctx act
+    let names : NameContext := .ofLocalContext lctx ci.mctx
+    let termKey (e : Expr) : TermKey := { expr := e, ppCtxHash := ppCtxHash }
+    let ppCode (e : Expr) : HighlightM CodeWithInfos := do
+      count .delaboratorCalls
+      runMeta (ppCodeWithInfos e)
+    let ppCodeAndFormat (e : Expr) : HighlightM (Highlighted × String) := do
+      count .delaboratorCalls
+      let ((code, fi), ngen) ← runMeta do
+        let r ← ppCodeAndFormatWithInfos e
+        pure (r, ← getNGen)
+      let hl ← renderTagged none code
+      let (fmt, annots) ← resolveFormatAnnotations fi.fmt fi.infos { ci' with ngen := ngen }
+      pure (hl, formatDataToJson fmt annots)
+    let renderTerm (e : Expr) : HighlightM (Highlighted × Option String) := do
+      if doCollectFormat then
+        let (hl, fmt) ← renderOrGetWithFormat (termKey e) names ppCodeAndFormat
+        pure (hl, some fmt)
+      else
+        let hl ← renderOrGet (termKey e) names fun e => do
+          renderTagged none (← ppCode e)
+        pure (hl, none)
 
     for c in lctx.decls do
       let some decl := c
         | continue
       if decl.isAuxDecl || decl.isImplementationDetail then continue
       let ppProofs := pp.proofs.get? (← getOptions) |>.getD false
-      match decl with
-      | .cdecl _index fvar name type _ _
-      | .ldecl _index fvar name type _ true _ => -- the `true` means it's from `have`
-        let nk := (← exprKind ci lctx none (.fvar fvar)).map (·.1)
-        let type ← runMeta <| instantiateMVars type
-        let tyStr ← renderOrGet type fun e => do
-          renderTagged none (← runMeta (ppCodeWithInfos e))
-        let ppType ← if doCollectFormat then
-          renderOrGetFormat type (ppFormatData · ci' runMeta)
-        else pure none
-        hyps := hyps.push ⟨#[⟨nk.getD .unknown, name.toString⟩], tyStr, ppType⟩
-      | .ldecl _index fvar name type val _ _ =>
-        let nk := (← exprKind ci lctx none (.fvar fvar)).map (·.1)
-        let type ← runMeta <| instantiateMVars type
-        let val ← runMeta <| instantiateMVars val
-        let tyDoc ← renderOrGetCodeWithInfos type (runMeta <| ppCodeWithInfos ·)
-        let valDoc ←
-          if !ppProofs && (← runMeta <| Meta.isProp type) then
-            pure (.text "···")
-          else renderOrGetCodeWithInfos val (runMeta <| ppCodeWithInfos ·)
-        let tyValStr ← renderTagged none <| .append <| #[tyDoc].append <|
-          if tyDoc.oneLine && valDoc.oneLine then #[.text " := ", valDoc]
-          else #[.text " := \n", valDoc.indent]
-        -- For let-bindings, skip format data (would need combined type+val format)
-        hyps := hyps.push ⟨#[⟨nk.getD .unknown, name.toString⟩], tyValStr, none⟩
-    let conclType ← runMeta <| instantiateMVars mvDecl.type
-    let concl ← renderOrGet conclType fun e => do
-      renderTagged none (← runMeta <| ppCodeWithInfos e)
-    let ppConcl ← if doCollectFormat then
-      renderOrGetFormat conclType (ppFormatData · ci' runMeta)
-    else pure none
-    goalView := goalView.push ⟨name, Meta.getGoalPrefix mvDecl, hyps, concl, ppConcl⟩
+      let hyp ← withCategory .goalHypotheses do
+        match decl with
+        | .cdecl _index fvar name type _ _
+        | .ldecl _index fvar name type _ true _ => -- the `true` means it's from `have`
+          let type := names.typeOf? fvar |>.getD type
+          cachedHypothesis { fvarId := fvar, type, value := none, ppCtxHash } names do
+            let nk := (← exprKind ci lctx (fun _ => pure names) none (.fvar fvar)).map (·.1)
+            let (tyStr, ppType) ← renderTerm type
+            pure (⟨#[⟨nk.getD .unknown, name.toString⟩], tyStr, ppType⟩ : Highlighted.Hypothesis Highlighted)
+        | .ldecl _index fvar name type val _ _ =>
+          let type := names.typeOf? fvar |>.getD type
+          let val ← runMeta <| instantiateMVars val
+          cachedHypothesis { fvarId := fvar, type, value := some val, ppCtxHash } names do
+            let nk := (← exprKind ci lctx (fun _ => pure names) none (.fvar fvar)).map (·.1)
+            let tyDoc ← renderOrGetCodeWithInfos (termKey type) names ppCode
+            let valDoc ←
+              if !ppProofs && (← runMeta <| Meta.isProp type) then
+                pure (.text "···")
+              else renderOrGetCodeWithInfos (termKey val) names ppCode
+            let tyValStr ← renderTagged none <| .append <| #[tyDoc].append <|
+              if tyDoc.oneLine && valDoc.oneLine then #[.text " := ", valDoc]
+              else #[.text " := \n", valDoc.indent]
+            -- For let-bindings, skip format data (would need combined type+val format)
+            pure ⟨#[⟨nk.getD .unknown, name.toString⟩], tyValStr, none⟩
+      hyps := hyps.push hyp
+    let (conclType, concl, ppConcl) ← withCategory .goalTargets do
+      let conclType ← runMeta <| instantiateMVars mvDecl.type
+      let (concl, ppConcl) ← renderTerm conclType
+      pure (conclType, concl, ppConcl)
+    let goal : Highlighted.Goal Highlighted := ⟨name, Meta.getGoalPrefix mvDecl, hyps, concl, ppConcl⟩
+    if showsMVars ci.mctx names conclType then
+      count .goalCacheUncached
+    else
+      count .goalCacheMisses
+      modify fun st => { st with goals := st.goals.insert goalKey (.ofDecl mvDecl ci.mctx) goal }
+    goalView := goalView.push goal
   pure goalView
 
 def tacticInfoGoals
-    (ci : ContextInfo) (tacticInfo : TacticInfo)
+    (ci : ContextInfo) (commandEnv : Environment) (tacticInfo : TacticInfo)
     (startPos endPos : Compat.String.Pos)
     (before : Bool := false) :
     HighlightM (Array (Highlighted.Goal Highlighted) × Compat.String.Pos × Compat.String.Pos) := do
   let goals := if before then tacticInfo.goalsBefore else tacticInfo.goalsAfter
   let ci := {ci with mctx := if before then tacticInfo.mctxBefore else tacticInfo.mctxAfter}
-  let goalView ← highlightGoals ci goals
+  let goalView ← highlightGoals ci commandEnv goals
 
   return (goalView, startPos, endPos)
 
@@ -1598,14 +2266,14 @@ partial def findTactics'
     : HighlightM (Option (Array (Highlighted.Goal Highlighted) × Compat.String.Pos × Compat.String.Pos)) := do
 
   if let some res := (← readThe InfoTable).tacticInfo? stx then
-    for (ci, tacticInfo) in res.reverse do
+    for (ci, tacticInfo, commandEnv) in res.reverse do
       if !before && !tacticInfo.goalsBefore.isEmpty && tacticInfo.goalsAfter.isEmpty then
         return some (#[], startPos, endPos)
 
       let goals := if before then tacticInfo.goalsBefore else tacticInfo.goalsAfter
       let ci := {ci with mctx := if before then tacticInfo.mctxBefore else tacticInfo.mctxAfter}
       if goals.isEmpty then continue
-      let goalView ← highlightGoals ci goals
+      let goalView ← highlightGoals ci commandEnv goals
 
       if !Output.inTacticState (← get).output goalView then
         return some (goalView, startPos, endPos)
@@ -1626,14 +2294,14 @@ partial def findAllTactics'
   let mut found := #[]
 
   if let some res := (← readThe InfoTable).tacticInfo? stx then
-    for (ci, tacticInfo) in res.reverse do
+    for (ci, tacticInfo, commandEnv) in res.reverse do
       if !before && !tacticInfo.goalsBefore.isEmpty && tacticInfo.goalsAfter.isEmpty then
         continue
 
       let goals := if before then tacticInfo.goalsBefore else tacticInfo.goalsAfter
       let ci := {ci with mctx := if before then tacticInfo.mctxBefore else tacticInfo.mctxAfter}
       if goals.isEmpty then continue
-      let goalView ← highlightGoals ci goals
+      let goalView ← highlightGoals ci commandEnv goals
 
       if !Output.inTacticState (← get).output goalView then
         found := found ++ goalView
@@ -1653,10 +2321,11 @@ partial def rwRuleGoals
   for t in trees do
     for (ci, info) in infoIncludingSyntax t stx do
       if let .ofTacticInfo ti := info then
+        let commandEnv := (infoTreeCommandEnv? t).getD ci.env
         if let some regionStart := ti.stx.getPos? (canonicalOnly := true) then
           if let some regionEnd := ti.stx.getTailPos? (canonicalOnly := true) then
             if regionStart == ruleStart then
-              return some (← tacticInfoGoals ci ti regionStart regionEnd (before := false))
+              return some (← tacticInfoGoals ci commandEnv ti regionStart regionEnd (before := false))
   return none
 
 /-- Tactics which should show inner tactic scripts' states as well as the full final state -/
@@ -1708,7 +2377,8 @@ partial def findTactics
           if tacticInfo.stx.getKind == nullKind then
             if let some tacStx := tacticInfo.stx.getArgs.back? then
               if tacStx == stx then
-                return some (← tacticInfoGoals ci tacticInfo startPos endPos (before := true))
+                let commandEnv := (infoTreeCommandEnv? t).getD ci.env
+                return some (← tacticInfoGoals ci commandEnv tacticInfo startPos endPos (before := true))
 
           match tacticInfo.stx with
           | `(Lean.Parser.Tactic.inductionAlt| $_lhs =>%$tk $rhs )
@@ -1901,7 +2571,8 @@ def highlightSpecial
                   if ti.stx.getKind == nullKind then
                     let preArr := i.stx[0]
                     if preArr.getKind == nullKind && preArr[0] == l then
-                      let (goals, _, _) ← tacticInfoGoals ci ti startPos endPos (before := true)
+                      let commandEnv := (infoTreeCommandEnv? t).getD ci.env
+                      let (goals, _, _) ← tacticInfoGoals ci commandEnv ti startPos endPos (before := true)
                       if !goals.isEmpty then
                         HighlightM.openTactic goals startPos endPos
                         lhsTactics := false
@@ -2258,7 +2929,8 @@ def highlight (stx : Syntax) (messages : Array Message)
     collectFormat,
     sigCache
   }
-  let ((), {output := output, ..}) ← highlight' trees stx true |>.run ctxt |>.run infoTable |>.run st
+  let ((), {output := output, ..}) ← withCommandEnv trees stx (highlight' trees stx true)
+    |>.run ctxt |>.run infoTable |>.run st
   pure <| .fromOutput output
 
 /--
@@ -2286,7 +2958,7 @@ def highlightIncludingUnparsed (stx : Syntax) (messages : Array Message)
 
   let infoTable : InfoTable := .ofInfoTrees trees
 
-  let doHighlight : HighlightM Unit := do
+  let doHighlight : HighlightM Unit := withCommandEnv trees stx do
     highlight' trees stx true
     if let some endPos := endPos? then
       fillMissingSourceUpTo endPos
@@ -2357,10 +3029,9 @@ def highlightMany (stxs : Array Syntax) (messages : Array Message)
   pure hls
 where
   go t stx : HighlightM Highlighted := withCurrHeartbeats do
-    -- The variable-type cache is scoped to a single syntax: its keys don't capture the
-    -- environment, and separate elaboration threads can reuse `FVarId`s.
-    ((← read).sigCache.modify fun c => { c with varTypes := {} } : IO _)
-    let _ ← highlight' (Option.map (#[·]) t |>.getD #[]) stx true
+    ((← read).sigCache.set {} : IO _)
+    let trees := Option.map (#[·]) t |>.getD #[]
+    let _ ← withCommandEnv trees stx (highlight' trees stx true)
     if (← read).includeUnparsed then
       if let some e := Internal.getTrailingOrTailPos? stx then
         fillMissingSourceUpTo e
@@ -2439,26 +3110,30 @@ start position, so a message is rendered exactly once, on the code it points at,
 different command produced it.
 -/
 def highlightFrontendResult (result : Compat.Frontend.FrontendResult)
-    (suppressNamespaces : List Name := []) (collectFormat := false) :
+    (suppressNamespaces : List Name := []) (collectFormat := false)
+    (timings? : Option (IO.Ref Timings) := none) :
     TermElabM (Array Highlighted) := do
-  let trees' := result.items.flatMap (·.info.toArray)
-  let allMessages := Compat.messageLogArray result.headerMessages ++
-    result.items.flatMap (fun i => Compat.messageLogArray i.messages)
   let fileMap ← getFileMap
-  let segments := moduleSegments fileMap result allMessages
-  let infoTable : InfoTable := .ofInfoTrees trees'
-  let modrefs := Lean.Server.findModuleRefs fileMap trees'
-  let ids := build modrefs
   let sigCache := ← IO.mkRef {}
-
-  let ctxt := {
-    ids,
+  let ctxt : Context := {
+    ids := {},
     definitionsPossible := true,
     includeUnparsed := false,
     suppressNamespaces := sortSuppress suppressNamespaces,
     collectFormat,
-    sigCache
+    sigCache,
+    timings?
   }
+  let (segments, infoTable, ids) ← (withCategory .setup do
+    IO.lazyPure fun _ =>
+      let trees' := result.items.flatMap (·.info.toArray)
+      let allMessages := Compat.messageLogArray result.headerMessages ++
+        result.items.flatMap (fun i => Compat.messageLogArray i.messages)
+      let segments := moduleSegments fileMap result allMessages
+      let infoTable : InfoTable := .ofInfoTrees trees'
+      let modrefs := Lean.Server.findModuleRefs fileMap trees'
+      (segments, infoTable, build modrefs) : ReaderT Context TermElabM _).run ctxt
+  let ctxt := { ctxt with ids }
 
   let mut hls := #[]
 
@@ -2477,13 +3152,15 @@ def highlightFrontendResult (result : Compat.Frontend.FrontendResult)
   for idx in [0:result.items.size] do
     let cmd := result.items[idx]!
     let st ← segmentState cmd.commandSyntax segments[idx + 1]!
+    sigCache.set {}
     let (hl, _) ← go cmd segments[idx + 1]! |>.run ctxt |>.run infoTable |>.run st
     hls := hls.push hl
 
   return hls
 where
   go (res : Compat.Frontend.FrontendItem) (seg : ModuleSegment) := do
-    let _ ← highlight' res.info.toArray res.commandSyntax true
+    let _ ← withCommandEnv res.info.toArray res.commandSyntax
+      (highlight' res.info.toArray res.commandSyntax true)
     flushSegment seg
     modifyGet fun (st : HighlightState) => (Highlighted.fromOutput st.output, {st with output := []})
   /--
@@ -2513,7 +3190,8 @@ def highlightProofState (ci : ContextInfo) (goals : List MVarId)
     collectFormat,
     sigCache
   }
-  let (hlGoals, _) ← highlightGoals ci goals |>.run ctxt |>.run infoTable |>.run .empty
+  let commandEnv := (infoTreesCommandEnv? trees).getD (← getEnv)
+  let (hlGoals, _) ← highlightGoals ci commandEnv goals |>.run ctxt |>.run infoTable |>.run .empty
   pure hlGoals
 
 
