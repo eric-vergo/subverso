@@ -5,6 +5,7 @@ Author: David Thrane Christiansen
 -/
 import SubVerso.Compat
 import SubVerso.Module
+import SubVerso.Module.Source
 
 open Lean Elab Frontend
 open Lean.Elab.Command hiding Context
@@ -140,7 +141,7 @@ unsafe def go (timer? : Option Timer) (asServer : Bool) (suppressedNamespaces : 
       let sp ← Compat.initSrcSearchPath
       let sp : SearchPath := (sp : List System.FilePath) ++ [("." : System.FilePath)]
       let fname ← do
-        if let some fname ← sp.findModuleWithExt "lean" modName then
+        if let some fname ← findModuleSource? sp modName then
           pure fname
         else
           throw <| IO.userError s!"Failed to load {modName} from {sp}"

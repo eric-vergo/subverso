@@ -11,4 +11,5 @@ public import SubVerso.Highlighting
 public import SubVerso.Module
 public import SubVerso.Module.Normalize
 public import SubVerso.Module.Decl
+public import SubVerso.Module.Source
 public import SubVerso.Signature

@@ -5,6 +5,7 @@ import SubVerso.Highlighting.Anchors
 import SubVerso.Highlighting.String
 import SubVerso.Module.Normalize
 import SubVerso.Module.Decl
+import SubVerso.Module.Source
 
 /-! These are SubVerso tests that don't involve a subprocess, to make development easier. -/
 
@@ -2411,3 +2412,32 @@ def collectFormatInput : String :=
     unless (j.getObjVal? "fmt").toOption.isSome && (j.getObjVal? "annotations").toOption.isSome do
       throwError "The {what} format data lacks `fmt` or `annotations`: {s}"
 
+/-!
+`Module.findModuleSource?` looks for a module's source in every root of the search path. Here the
+first root has a directory named after the module's first component but not the module, as
+happens when a package requires another package from a directory that encloses it.
+-/
+#eval show IO Unit from do
+  let dir : System.FilePath := ".lake" / "module-source-test"
+  if ← dir.pathExists then IO.FS.removeDirAll dir
+  let outer := dir / "outer"
+  let inner := dir / "outer" / "inner"
+  let empty := dir / "empty"
+  IO.FS.createDirAll (outer / "Pkg")
+  IO.FS.createDirAll (inner / "Pkg")
+  IO.FS.createDirAll empty
+  IO.FS.writeFile (inner / "Pkg" / "Inner.lean") "def x : Nat := 1\n"
+  IO.FS.writeFile (outer / "Pkg" / "Outer.lean") "def y : Nat := 2\n"
+  IO.FS.writeFile (inner / "Pkg" / "Outer.lean") "def y : Nat := 3\n"
+  let sp : Lean.SearchPath := [empty, outer, inner]
+  let expect (mod : Lean.Name) (expected : Option System.FilePath) : IO Unit := do
+    let found ← Module.findModuleSource? sp mod
+    unless found == expected do
+      throw <| IO.userError s!"Source of {mod}: expected {expected}, got {found}"
+  -- Only the second root that has a `Pkg` directory contains the module
+  expect `Pkg.Inner (some (inner / "Pkg" / "Inner.lean"))
+  -- Both roots contain the module, and the first one wins
+  expect `Pkg.Outer (some (outer / "Pkg" / "Outer.lean"))
+  expect `Pkg.Missing none
+  expect `Other.Inner none
+  IO.FS.removeDirAll dir
